@@ -1,0 +1,536 @@
+/*
+ * gp_iccamera.c — the ptp2 ⇆ ImageCaptureCore transport bridge (compiled into the framework).
+ *
+ * ptp2 runs a PTP transaction as: sendreq_func → (senddata_func | getdata_func | ø) → getresp_func,
+ * moving data through a PTPDataHandler. ICCameraDevice.requestSendPTPCommand does a WHOLE
+ * transaction in one async call (command + out-data → in-data + response). So we buffer the
+ * command in sendreq, fire the callback at the phase that has all the data, and hand the
+ * response back in getresp. The transaction-id is forged to what ptp2 expects, because
+ * ImageCaptureCore owns the real PTP session and its transaction ids.
+ */
+#include "config.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>   /* usleep */
+#if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
+#  include <iconv.h>
+#  include <langinfo.h>
+#endif
+
+#include <gphoto2/gphoto2-camera.h>
+#include <gphoto2/gphoto2-context.h>
+
+#include "ptp.h"
+#include "ptp-private.h"
+#include "gp_iccamera.h"
+
+struct gp_iccamera {
+	PTPData        ptpdata;   /* MUST be first: ptp2 reads (PTPData*)params->data */
+	Camera        *camera;
+	GPContext     *context;
+
+	gp_iccamera_transact_cb cb;
+	void          *cbctx;
+
+	/* per-transaction scratch */
+	unsigned char  cmd[12 + 5 * 4];
+	int            cmdlen;
+	int            fired;
+	unsigned char *indata;
+	int            indatalen;
+	unsigned char  resp[64];
+	int            resplen;
+};
+
+/* --- little-endian helpers --- */
+static void     put16(unsigned char *p, uint16_t v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
+static void     put32(unsigned char *p, uint32_t v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24); }
+static uint16_t get16(const unsigned char *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t get32(const unsigned char *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24)); }
+
+/* Fire one requestSendPTPCommand via the app callback. Stashes response + in-data. */
+static uint16_t
+icc_fire(struct gp_iccamera *icc, const unsigned char *out, int outlen)
+{
+	unsigned char *in = NULL;
+	int inlen = 0, rc;
+
+	if (icc->indata) { free(icc->indata); icc->indata = NULL; icc->indatalen = 0; }
+	icc->resplen = (int)sizeof(icc->resp);
+	rc = icc->cb(icc->cbctx, icc->cmd, icc->cmdlen, out, outlen, &in, &inlen, icc->resp, &icc->resplen);
+	if (rc != 0) {
+		if (in) free(in);
+		return PTP_ERROR_IO;
+	}
+	icc->indata = in;
+	icc->indatalen = inlen;
+	icc->fired = 1;
+	return PTP_RC_OK;
+}
+
+/* --- PTPParams transport vtable --- */
+
+static uint16_t
+icc_sendreq(PTPParams *params, PTPContainer *req, int dataphase)
+{
+	struct gp_iccamera *icc = (struct gp_iccamera *)params->data;
+	uint32_t p[5];
+	int np = req->Nparam, i;
+	(void)dataphase;
+	if (np > 5) np = 5;
+	icc->cmdlen = 12 + 4 * np;
+	put32(icc->cmd + 0, (uint32_t)icc->cmdlen);
+	put16(icc->cmd + 4, 1);            /* PTP command block */
+	put16(icc->cmd + 6, req->Code);
+	put32(icc->cmd + 8, 0);            /* transaction id — ImageCaptureCore rewrites it */
+	p[0] = req->Param1; p[1] = req->Param2; p[2] = req->Param3; p[3] = req->Param4; p[4] = req->Param5;
+	for (i = 0; i < np; i++) put32(icc->cmd + 12 + 4 * i, p[i]);
+	icc->fired = 0;
+	return PTP_RC_OK;
+}
+
+static uint16_t
+icc_senddata(PTPParams *params, PTPContainer *ptp, uint64_t size, PTPDataHandler *handler)
+{
+	struct gp_iccamera *icc = (struct gp_iccamera *)params->data;
+	unsigned char *buf = NULL;
+	unsigned long got = 0;
+	uint16_t r;
+	(void)ptp;
+	if (size > 0) {
+		buf = malloc((size_t)size);
+		if (!buf) return PTP_ERROR_IO;
+		r = handler->getfunc(params, handler->priv, (unsigned long)size, buf, &got);
+		if (r != PTP_RC_OK) { free(buf); return r; }
+	}
+	r = icc_fire(icc, buf, (int)got);
+	if (buf) free(buf);
+	return r;
+}
+
+static uint16_t
+icc_getdata(PTPParams *params, PTPContainer *ptp, PTPDataHandler *handler)
+{
+	struct gp_iccamera *icc = (struct gp_iccamera *)params->data;
+	uint16_t r;
+	(void)ptp;
+	r = icc_fire(icc, NULL, 0);
+	if (r != PTP_RC_OK) return r;
+	if (icc->indata && icc->indatalen > 0)
+		handler->putfunc(params, handler->priv, (unsigned long)icc->indatalen, icc->indata);
+	return PTP_RC_OK;
+}
+
+static uint16_t
+icc_getresp(PTPParams *params, PTPContainer *resp)
+{
+	struct gp_iccamera *icc = (struct gp_iccamera *)params->data;
+	uint16_t code;
+	int np, off = 12;
+
+	if (!icc->fired) {                      /* NODATA op: fire now (command only) */
+		uint16_t r = icc_fire(icc, NULL, 0);
+		if (r != PTP_RC_OK) return r;
+	}
+	if (icc->resplen < 8) return PTP_ERROR_IO;
+
+	code = get16(icc->resp + 6);
+	resp->Code = code;
+	resp->SessionID = params->session_id;
+	resp->Transaction_ID = params->transaction_id - 1;   /* forge: ICC owns the real ids */
+	np = (icc->resplen - 12) / 4;
+	if (np < 0) np = 0;
+	if (np > 5) np = 5;
+	resp->Nparam = (uint8_t)np;
+	resp->Param1 = np > 0 ? get32(icc->resp + off + 0)  : 0;
+	resp->Param2 = np > 1 ? get32(icc->resp + off + 4)  : 0;
+	resp->Param3 = np > 2 ? get32(icc->resp + off + 8)  : 0;
+	resp->Param4 = np > 3 ? get32(icc->resp + off + 12) : 0;
+	resp->Param5 = np > 4 ? get32(icc->resp + off + 16) : 0;
+	icc->fired = 0;
+	return code;   /* 0x2001 == PTP_RC_OK on success, else the camera's error code */
+}
+
+/* Events: ImageCaptureCore drains the interrupt endpoint itself; EOS events are fetched
+ * as commands (ptp_canon_eos_getevent). Stub the async event channel as "no event". */
+static uint16_t icc_event_stub(PTPParams *params, PTPContainer *event) { (void)params; (void)event; return PTP_ERROR_TIMEOUT; }
+static uint16_t icc_cancel_stub(PTPParams *params, uint32_t tid)        { (void)params; (void)tid;  return PTP_RC_OK; }
+
+static void icc_debug(void *data, const char *fmt, va_list args) { (void)data; (void)fmt; (void)args; }
+static void icc_error(void *data, const char *fmt, va_list args) { (void)data; vfprintf(stderr, fmt, args); fputc('\n', stderr); }
+
+/* --- lifecycle --- */
+
+gp_iccamera *
+gp_iccamera_new(gp_iccamera_transact_cb cb, void *ctx)
+{
+	struct gp_iccamera *icc;
+	PTPParams *params;
+
+	if (!cb) return NULL;
+	icc = calloc(1, sizeof(*icc));
+	if (!icc) return NULL;
+	icc->cb = cb;
+	icc->cbctx = ctx;
+
+	if (gp_camera_new(&icc->camera) < GP_OK) { free(icc); return NULL; }
+	icc->context = gp_context_new();
+	icc->camera->pl = calloc(1, sizeof(CameraPrivateLibrary));
+	if (!icc->camera->pl) {
+		gp_context_unref(icc->context);
+		gp_camera_free(icc->camera);
+		free(icc);
+		return NULL;
+	}
+	icc->ptpdata.camera = icc->camera;
+	icc->ptpdata.context = icc->context;
+
+	params = &icc->camera->pl->params;
+	params->data              = icc;               /* == &icc->ptpdata (first member) */
+	params->byteorder         = PTP_DL_LE;
+	params->maxpacketsize     = 512;
+	params->sendreq_func      = icc_sendreq;
+	params->senddata_func     = icc_senddata;
+	params->getdata_func      = icc_getdata;
+	params->getresp_func      = icc_getresp;
+	params->event_check       = icc_event_stub;
+	params->event_check_queue = icc_event_stub;
+	params->event_wait        = icc_event_stub;
+	params->cancelreq_func    = icc_cancel_stub;
+	params->debug_func        = icc_debug;
+	params->error_func        = icc_error;
+
+#if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
+	{
+		char *curloc = nl_langinfo(CODESET);
+		if (!curloc) curloc = "UTF-8";
+		params->cd_ucs2_to_locale = iconv_open(curloc, "UCS-2LE");
+		params->cd_locale_to_ucs2 = iconv_open("UCS-2LE", curloc);
+	}
+#endif
+
+	/* ImageCaptureCore already opened the PTP session — do NOT ptp_opensession().
+	 * Read device info so the ptp2 vendor logic knows what it's talking to. */
+	if (ptp_getdeviceinfo(params, &params->deviceinfo) != PTP_RC_OK) {
+		gp_iccamera_free(icc);
+		return NULL;
+	}
+	/* Newer Canons report the MTP/Microsoft vendor extension (0x06) over this interface.
+	 * Restore the Canon EOS extension id so ptp2's Canon-specific capture/config/event
+	 * code paths activate — the same fixup libgphoto2's own camera_init performs. */
+	if (params->deviceinfo.VendorExtensionID == PTP_VENDOR_MICROSOFT &&
+	    params->deviceinfo.Manufacturer &&
+	    strstr(params->deviceinfo.Manufacturer, "Canon"))
+		params->deviceinfo.VendorExtensionID = PTP_VENDOR_CANON;
+
+	/* Canon EOS: enter remote mode + enable events, then drain the initial property dump
+	 * so the config get-functions can read current values from params->canon_props. */
+	if (params->deviceinfo.VendorExtensionID == PTP_VENDOR_CANON) {
+		int i;
+		ptp_canon_eos_setremotemode(params, 1);
+		ptp_canon_eos_seteventmode(params, 1);
+		params->eos_captureenabled = 1;
+		for (i = 0; i < 3; i++)
+			ptp_check_eos_events(params);
+	}
+	return icc;
+}
+
+void
+gp_iccamera_free(gp_iccamera *icc)
+{
+	PTPParams *params;
+	if (!icc) return;
+	params = &icc->camera->pl->params;
+#if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
+	if (params->cd_ucs2_to_locale != (iconv_t)-1) iconv_close(params->cd_ucs2_to_locale);
+	if (params->cd_locale_to_ucs2 != (iconv_t)-1) iconv_close(params->cd_locale_to_ucs2);
+#endif
+	ptp_free_deviceinfo(&params->deviceinfo);
+	if (icc->indata) free(icc->indata);
+	free(icc->camera->pl);
+	icc->camera->pl = NULL;
+	gp_camera_free(icc->camera);
+	gp_context_unref(icc->context);
+	free(icc);
+}
+
+/* --- proof operations --- */
+
+int
+gp_iccamera_get_deviceinfo(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	PTPDeviceInfo *di = &params->deviceinfo;
+	snprintf(out, (size_t)outlen,
+	         "%s %s | ext 0x%08x (%s) | %u ops, %u props, %u events",
+	         di->Manufacturer ? di->Manufacturer : "?",
+	         di->Model ? di->Model : "?",
+	         di->VendorExtensionID,
+	         di->VendorExtensionID == PTP_VENDOR_CANON ? "Canon EOS" : "other",
+	         di->Operations_len, di->DeviceProps_len, di->Events_len);
+	return 0;
+}
+
+int
+gp_iccamera_eos_handshake(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r1 = ptp_canon_eos_setremotemode(params, 1);
+	uint16_t r2 = ptp_canon_eos_seteventmode(params, 1);
+	snprintf(out, (size_t)outlen, "EOS SetRemoteMode=0x%04x, SetEventMode=0x%04x", r1, r2);
+	return (r1 == PTP_RC_OK && r2 == PTP_RC_OK) ? 0 : -1;
+}
+
+void gp_iccamera_freebuf(uint8_t *p) { if (p) free(p); }
+
+/* --- config tree (drives config.c's full widget tree over our transport) --- */
+
+int
+gp_iccamera_list_config(gp_iccamera *icc, char *out, int outlen)
+{
+	CameraList *list = NULL;
+	char *sp = out; int sl = outlen, i, n, ret;
+	if (outlen) out[0] = 0;
+	if (gp_list_new(&list) < GP_OK) return -1;
+	ret = camera_list_config(icc->camera, list, icc->context);
+	if (ret != GP_OK) { gp_list_free(list); return ret; }
+	n = gp_list_count(list);
+	for (i = 0; i < n; i++) {
+		const char *name = NULL;
+		gp_list_get_name(list, i, &name);
+		int w = snprintf(sp, (size_t)sl, "%s\n", name ? name : "?");
+		if (w > 0 && w < sl) { sp += w; sl -= w; }
+	}
+	gp_list_free(list);
+	return 0;
+}
+
+int
+gp_iccamera_get_config(gp_iccamera *icc, const char *name,
+                       char *value, int vlen, char *choices, int clen)
+{
+	CameraWidget *w = NULL;
+	CameraWidgetType type;
+	int ret, i, n;
+
+	if (value && vlen) value[0] = 0;
+	if (choices && clen) choices[0] = 0;
+
+	ret = camera_get_single_config(icc->camera, name, &w, icc->context);
+	if (ret != GP_OK || !w) { if (value && vlen) snprintf(value, (size_t)vlen, "(unavailable)"); return ret ? ret : -1; }
+
+	gp_widget_get_type(w, &type);
+	switch (type) {
+	case GP_WIDGET_RADIO:
+	case GP_WIDGET_MENU:
+	case GP_WIDGET_TEXT: {
+		char *val = NULL;
+		char *cp = choices; int cl = clen;
+		gp_widget_get_value(w, &val);
+		if (value && vlen && val) snprintf(value, (size_t)vlen, "%s", val);
+		n = gp_widget_count_choices(w);
+		for (i = 0; i < n && cl > 1; i++) {
+			const char *ch = NULL;
+			gp_widget_get_choice(w, i, &ch);
+			int cw = snprintf(cp, (size_t)cl, "%s\n", ch ? ch : "");
+			if (cw > 0 && cw < cl) { cp += cw; cl -= cw; }
+		}
+		break;
+	}
+	case GP_WIDGET_TOGGLE: {
+		int val = 0;
+		gp_widget_get_value(w, &val);
+		if (value && vlen) snprintf(value, (size_t)vlen, "%d", val);
+		if (choices && clen) snprintf(choices, (size_t)clen, "0\n1\n");
+		break;
+	}
+	case GP_WIDGET_RANGE: {
+		float val = 0, mn = 0, mx = 0, st = 0;
+		gp_widget_get_value(w, &val);
+		gp_widget_get_range(w, &mn, &mx, &st);
+		if (value && vlen) snprintf(value, (size_t)vlen, "%g", val);
+		if (choices && clen) snprintf(choices, (size_t)clen, "%g..%g/%g", mn, mx, st);
+		break;
+	}
+	default:
+		if (value && vlen) snprintf(value, (size_t)vlen, "(type %d)", (int)type);
+		break;
+	}
+	gp_widget_free(w);
+	return 0;
+}
+
+int
+gp_iccamera_set_config(gp_iccamera *icc, const char *name, const char *value)
+{
+	CameraWidget *w = NULL;
+	CameraWidgetType type;
+	int ret;
+
+	ret = camera_get_single_config(icc->camera, name, &w, icc->context);
+	if (ret != GP_OK || !w) return ret ? ret : -1;
+
+	gp_widget_get_type(w, &type);
+	switch (type) {
+	case GP_WIDGET_RADIO:
+	case GP_WIDGET_MENU:
+	case GP_WIDGET_TEXT:
+		gp_widget_set_value(w, value);
+		break;
+	case GP_WIDGET_TOGGLE: {
+		int v = atoi(value);
+		gp_widget_set_value(w, &v);
+		break;
+	}
+	case GP_WIDGET_RANGE: {
+		float f = (float)atof(value);
+		gp_widget_set_value(w, &f);
+		break;
+	}
+	default:
+		gp_widget_free(w);
+		return -2;
+	}
+	gp_widget_set_changed(w, 1);
+	ret = camera_set_single_config(icc->camera, name, w, icc->context);
+	gp_widget_free(w);
+	return ret;
+}
+
+/* Ported from ptp2's camera_trigger_canon_eos_capture (non-M path), using only exported
+ * ptp_* functions so it runs over our transport. First iteration — logs each step so the
+ * real device behaviour can be read from `status`. */
+int
+gp_iccamera_capture(gp_iccamera *icc, uint8_t **outdata, int *outlen,
+                    char *ext, int extlen, char *status, int statuslen)
+{
+	PTPParams        *params = &icc->camera->pl->params;
+	PTPCanonEOSEvent  ev;
+	PTPObjectInfo     oi;
+	uint16_t          r;
+	int               i, tries;
+	char             *sp = status; int sl = statuslen;
+#define SLOG(...) do { int _n = snprintf(sp, (size_t)sl, __VA_ARGS__); if (_n > 0 && _n < sl) { sp += _n; sl -= _n; } } while (0)
+
+	*outdata = NULL; *outlen = 0;
+	memset(&oi, 0, sizeof(oi));
+	if (ext && extlen) snprintf(ext, (size_t)extlen, "jpg");
+
+	/* 1. ensure EOS remote mode (idempotent) */
+	ptp_canon_eos_setremotemode(params, 1);
+	ptp_canon_eos_seteventmode(params, 1);
+	params->eos_captureenabled = 1;
+
+	/* 2. drain stale events so the camera does not report busy */
+	ptp_check_eos_events(params);
+	while (ptp_get_one_eos_event(params, &ev)) ptp_free_eos_event(&ev);
+
+	/* 3. press sequence: half-press (AF), settle, full-press (retry on DeviceBusy), release */
+	r = ptp_canon_eos_remotereleaseon(params, 1, 0);
+	if (r != PTP_RC_OK) { SLOG("half-press failed 0x%04x", r); return -1; }
+	usleep(400 * 1000);
+	ptp_check_eos_events(params);
+	while (ptp_get_one_eos_event(params, &ev)) ptp_free_eos_event(&ev);
+
+	for (tries = 0; ; tries++) {
+		r = ptp_canon_eos_remotereleaseon(params, 2, 0);
+		if (r == 0x2019 /* DeviceBusy */ && tries < 5) { usleep(700 * 1000); continue; }
+		break;
+	}
+	if (r != PTP_RC_OK) {
+		SLOG("full-press failed 0x%04x", r);
+		ptp_canon_eos_remotereleaseoff(params, 1);
+		return -2;
+	}
+	ptp_canon_eos_remotereleaseoff(params, 2);
+	ptp_canon_eos_remotereleaseoff(params, 1);
+	SLOG("shutter fired; ");
+
+	/* 4. wait (~12s) for the ObjectAdded event */
+	for (i = 0; i < 60 && !oi.Handle; i++) {
+		ptp_check_eos_events(params);
+		while (ptp_get_one_eos_event(params, &ev)) {
+			if (ev.type == PTP_EOSEvent_ObjectAdded && ev.u.object.Handle) {
+				oi = ev.u.object;   /* take ownership of this event's ObjectInfo */
+				break;
+			}
+			ptp_free_eos_event(&ev);
+		}
+		if (oi.Handle) break;
+		usleep(200 * 1000);
+	}
+	if (!oi.Handle) { SLOG("no ObjectAdded event within timeout (is capturetarget the card?)"); return -3; }
+
+	SLOG("obj 0x%08x storage 0x%08x fmt 0x%04x size %llu; ",
+	     oi.Handle, oi.StorageID, oi.ObjectFormat, (unsigned long long)oi.ObjectSize);
+	if (ext && extlen) {
+		if (oi.ObjectFormat == PTP_OFC_CANON_CR3) snprintf(ext, (size_t)extlen, "cr3");
+		else if (oi.ObjectFormat == PTP_OFC_CANON_CRW || oi.ObjectFormat == PTP_OFC_CANON_CRW3) snprintf(ext, (size_t)extlen, "cr2");
+		else snprintf(ext, (size_t)extlen, "jpg");
+	}
+
+	/* 5. download in ≤1MB chunks (the EOS R dislikes large single reads) */
+	{
+		uint32_t total = (uint32_t)oi.ObjectSize, offset = 0;
+		uint8_t *buf = NULL;
+
+		if (total == 0) {   /* size unknown: one big read, use whatever comes back */
+			unsigned char *chunk = NULL; uint32_t got = 0x0fffffff;
+			r = ptp_getpartialobject(params, oi.Handle, 0, got, &chunk, &got);
+			if (r != PTP_RC_OK || !chunk) { SLOG("getobject failed 0x%04x", r); if (oi.Filename) free(oi.Filename); return -4; }
+			ptp_canon_eos_transfercomplete(params, oi.Handle);
+			*outdata = chunk; *outlen = (int)got;
+			SLOG("downloaded %u bytes", got);
+			if (oi.Filename) free(oi.Filename);
+			return 0;
+		}
+
+		buf = malloc(total);
+		if (!buf) { SLOG("out of memory (%u)", total); if (oi.Filename) free(oi.Filename); return -5; }
+		while (offset < total) {
+			unsigned char *chunk = NULL;
+			uint32_t want = total - offset;
+			if (want > (1u << 20)) want = (1u << 20);
+			r = ptp_getpartialobject(params, oi.Handle, offset, want, &chunk, &want);
+			if (r != PTP_RC_OK || !chunk) { SLOG("getpartialobject@%u failed 0x%04x", offset, r); free(buf); if (oi.Filename) free(oi.Filename); return -4; }
+			memcpy(buf + offset, chunk, want);
+			free(chunk);
+			if (want == 0) break;
+			offset += want;
+		}
+		ptp_canon_eos_transfercomplete(params, oi.Handle);
+		*outdata = buf; *outlen = (int)offset;
+		SLOG("downloaded %d bytes", (int)offset);
+	}
+	if (oi.Filename) free(oi.Filename);
+	return 0;
+#undef SLOG
+}
+
+int
+gp_iccamera_raw_op(gp_iccamera *icc, uint16_t opcode,
+                   const uint32_t *params_in, int nparams, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	PTPContainer ptp;
+	unsigned char *data = NULL;
+	unsigned int rlen = 0;
+	uint16_t r;
+	int i;
+
+	memset(&ptp, 0, sizeof(ptp));
+	ptp.Code = opcode;
+	if (nparams > 5) nparams = 5;
+	ptp.Nparam = (uint8_t)nparams;
+	for (i = 0; i < nparams; i++)
+		(&ptp.Param1)[i] = params_in[i];
+
+	r = ptp_transaction(params, &ptp, PTP_DP_GETDATA, 0, &data, &rlen);
+	if (data) free(data);
+	snprintf(out, (size_t)outlen, "op 0x%04x → response 0x%04x, %u bytes data", opcode, r, rlen);
+	return (int)r;
+}
