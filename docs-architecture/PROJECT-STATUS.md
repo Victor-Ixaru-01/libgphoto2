@@ -4,8 +4,9 @@
 libgphoto2's `ptp2` engine, via Apple's App-Store-legal `ICCameraDevice.requestSendPTPCommand`.
 
 **Status (all validated on a real Canon EOS R50 + iPhone unless noted):**
-Phases 0–3 done and working on hardware; Phase 4 (config tree) built + compiles, pending
-on-hardware run. **libgphoto2 is capturing 15 MB RAW files from a Canon over USB on an iPhone.**
+Phases 0–3 done and working on hardware; Phase 4 (config tree) and Phase 5 (live view)
+built + compile, pending on-hardware run. **libgphoto2 is capturing 15 MB RAW files from a
+Canon over USB on an iPhone.**
 
 Two locations in play:
 - **libgphoto2 repo / iOS build:** `/Volumes/Extended-2TB/GitHub/libgphoto2/.claude/worktrees/libgphoto2-docs-architecture-a36109/` (branch `claude/libgphoto2-docs-architecture-a36109`). The engine + build harness + docs.
@@ -56,7 +57,7 @@ autotools/meson — they're absent on the machine).
 (retry on `0x2019` DeviceBusy) → release, polls `ptp_check_eos_events`/`ptp_get_one_eos_event`
 for `ObjectAdded`, downloads via `ptp_getpartialobject` (≤1 MB chunks) + `ptp_canon_eos_transfercomplete`.
 - Verified on R50: fired shutter, downloaded a **15.8 MB CR3** (card object `storage 0x00020001`) — standard `GetPartialObject` worked for card objects.
-- App: **Capture** button → saves file to Documents, shows JPEG inline (CR3/RAW won't render → no preview when the body shoots RAW).
+- App: **Capture** button → shows JPEG inline (CR3/RAW won't render → no preview when the body shoots RAW). **Policy:** the shot always stays on the camera card — bytes are pulled into memory for preview only, never written to the device (see `EDSDK-CAPABILITY-MAP.md`).
 
 ### Phase 4 — Config tree 🔨 (built + compiles; NOT yet run on hardware)
 The config.c functions (`camera_get_single_config`/`set_single_config`/`list_config`) are
@@ -65,16 +66,29 @@ tree with human-readable value translation, no library.c patch.
 - `gp_iccamera_list_config` / `get_config(name)` / `set_config(name,value)` in `gp_iccamera.c`.
 - `gp_iccamera_new` now primes Canon EOS: `SetRemoteMode`+`SetEventMode`+`eos_captureenabled` then `ptp_check_eos_events` ×3 (fills `params->canon_props` so config reads find current values).
 - App: `LibGPhoto2Tester` reads a curated set (`imageformat, iso, shutterspeed, aperture, whitebalance, autoexposuremode, exposurecompensation`) after engine-ready; ContentView shows each as a `Menu` picker; picking calls `gp_iccamera_set_config`.
+- **On-camera changes:** a 1.5 s `Timer` (`refreshSettings`) re-reads the curated set so dials/menus changed *on the body* propagate back — `camera_get_single_config`→`_get_config` drains `ptp_check_eos_events` on every read, so the values are current. Updates land **in place** (only when changed) to avoid closing an open picker; skipped during capture; a guard prevents overlapping polls on the serial queue.
 - **Next run should:** show the settings panel; changing `imageformat` to a JPEG option would make future captures preview inline. If a setting reads "(unavailable)" or set fails, the log shows it → likely needs more `ptp_check_eos_events` priming or the value string must exactly match a choice.
+
+### Phase 5 — Live view 🔨 (built + compiles; NOT yet run on hardware)
+Streamed EVF frames, ported from library.c's Canon EOS `GET_VIEWFINDER` path using only
+exported `ptp_*` functions so it runs over our transport.
+- **`gp_iccamera.c`**: a `_start` / `_frame` / `_stop` triad in `gp_iccamera.h`.
+  - `gp_iccamera_liveview_start` — sets `EVFMode`=1 and routes `EVFOutputDevice` (`0xD1B0`) to **TFT + PC = 3** (bitmask: bit0 TFT/rear screen, bit1 PC, bit2/3 MOBILE). PC-alone (2) blanks the camera's own screen, so we OR in the TFT bit and only write when TFT+PC aren't both already up. Then `ptp_canon_eos_keepdeviceon` so the body doesn't auto-shutdown, `params->inliveview=1`.
+  - `gp_iccamera_liveview_frame` — one `ptp_check_eos_events`, then `ptp_canon_eos_get_viewfinder_image`; walks the returned blobs (`[u32 len][u32 type][payload len-8]`, type 1/11 JPEG, 9 movie-mode) and hands back the first frame malloc'd (free with `gp_iccamera_freebuf`). **Returns 1 (soft) on `0xA102`/busy = "no frame yet"** — the first ~1s after enabling legitimately returns this.
+  - `gp_iccamera_liveview_stop` — `ptp_canon_eos_end_viewfinder`, clears `inliveview`.
+  - **Shutter-shares-EVF guard:** `gp_iccamera_capture` and `gp_iccamera_free` now end the viewfinder first if `inliveview` is set.
+- App: **`LibGPhoto2Tester`** — `startLiveView`/`stopLiveView` + a self-rescheduling `liveViewLoop` on the background `work` queue (each `_frame` blocks); pushes `UIImage`s to `liveViewImage`. `capture()` stops LV first. ContentView shows a **Live View / Stop LV** button + a 300pt preview that supersedes the captured still while streaming.
+- Built into the xcframework; `gp_iccamera_liveview_*` present as `T` symbols in both slices; the app compiles + links for the iOS simulator.
+- **Next run should:** tap Live View → after a brief `0xA102` spin-up, a live JPEG stream; Capture / Stop LV tears it down cleanly. If frames never arrive, check `EVFOutputDevice` actually took the PC bit; if it pegs CPU, throttle the loop (~20 fps).
 
 ---
 
 ## What still needs doing
 
-1. **Run Phase 4 on hardware** — verify settings read/write; confirm `imageformat`→JPEG then Capture shows a preview.
-2. **Live view** — `gp_iccamera_liveview_frame()` calling `ptp_canon_eos_get_viewfinder_image` (needs EVF output device set to PC, prop `0xD1B0`=2); stream frames to a SwiftUI `Image`. (Opcode `0x9153`, param `0x00200000`.)
-3. **Capture polish** — embedded-thumbnail preview for RAW (`ptp_getthumb`), RAW+JPEG, save-to-Photos (needs `NSPhotoLibraryAddUsageDescription`), burst.
-4. **Config polish** — expose the full `list_config` set (not just curated), typed widgets (toggle/range/date), section grouping.
+1. **Run Phases 4 & 5 on hardware** — Phase 4: verify settings read/write; confirm `imageformat`→JPEG then Capture shows a preview. Phase 5: tap Live View, confirm the JPEG stream comes up after the `0xA102` spin-up and that Capture / Stop LV tear it down cleanly. Both are built + compile; neither has run on the R50 yet.
+2. **Capture polish** — embedded-thumbnail preview for RAW (`ptp_getthumb`), RAW+JPEG, save-to-Photos (needs `NSPhotoLibraryAddUsageDescription`), burst.
+3. **Config polish** — expose the full `list_config` set (not just curated), typed widgets (toggle/range/date), section grouping.
+4. **Live-view polish** — throttle the frame loop to a target fps if it pegs CPU; overlay focus/exposure; drive AF via `ptp_canon_eos_remotereleaseon(1)` while streaming.
 5. **Turn the test app into a reusable framework** — wrap `gp_iccamera` in a clean Swift package/`CanonKit` API (`discover/connect/capture/liveView/settings`), separate from the test UI.
 6. **Licensing (BLOCKER for App Store):** libgphoto2 is **LGPL-2.1**. Currently linked as a **static** `.a` inside the app — that conflicts with LGPL relink requirements. Ship libgphoto2 as an **embedded dynamic framework** + publish the iOS patches, and get a legal review before submission. (See `ios-framework-plan.md` Risk B.)
 7. **macOS target caveat:** the xcframework is iOS-only; if the Mac/EDSDK target is built, filter the framework to iOS in *Build Phases → Link Binary → Filters* (the bridging header already gates the includes with `#if TARGET_OS_IOS`).
@@ -115,6 +129,8 @@ includes `<gphoto2/gphoto2.h>`, `gp_ios_register.h`, `gp_iccamera.h` under `#if 
 ---
 
 ## Reference docs (in `docs-architecture/`)
+- `EDSDK-CAPABILITY-MAP.md` — **EDSDK → ptp2 capability map + tracker** (what of Canon's official SDK we can/can't do on iOS via libgphoto2, and implementation status). Resumable per-capability checklist.
+- `R50-TEST-CHECKLIST.md` — **on-device test pass** for the R50: one ordered run verifying Phases 0–5 + the EDSDK build-out, with the exact `[GP2]` log strings to check per step.
 - `ios-framework-plan.md` — the phased plan with per-phase status + risks (LGPL, -21249).
 - `ios-phase0-runbook.md` — the PTP-over-ICCameraDevice probe + corrected Canon opcode map.
 - `canon-cameras.md` — Canon protocol details (EOS vs PowerShot dialects, opcodes, config).

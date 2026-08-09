@@ -245,6 +245,7 @@ gp_iccamera_free(gp_iccamera *icc)
 	PTPParams *params;
 	if (!icc) return;
 	params = &icc->camera->pl->params;
+	if (params->inliveview) { params->inliveview = 0; ptp_canon_eos_end_viewfinder(params); }
 #if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
 	if (params->cd_ucs2_to_locale != (iconv_t)-1) iconv_close(params->cd_ucs2_to_locale);
 	if (params->cd_locale_to_ucs2 != (iconv_t)-1) iconv_close(params->cd_locale_to_ucs2);
@@ -420,6 +421,9 @@ gp_iccamera_capture(gp_iccamera *icc, uint8_t **outdata, int *outlen,
 	memset(&oi, 0, sizeof(oi));
 	if (ext && extlen) snprintf(ext, (size_t)extlen, "jpg");
 
+	/* live view and the shutter share the EVF; leave live view before releasing */
+	if (params->inliveview) { params->inliveview = 0; ptp_canon_eos_end_viewfinder(params); }
+
 	/* 1. ensure EOS remote mode (idempotent) */
 	ptp_canon_eos_setremotemode(params, 1);
 	ptp_canon_eos_seteventmode(params, 1);
@@ -509,6 +513,297 @@ gp_iccamera_capture(gp_iccamera *icc, uint8_t **outdata, int *outlen,
 	if (oi.Filename) free(oi.Filename);
 	return 0;
 #undef SLOG
+}
+
+/* --- live view (ported from library.c's Canon EOS GET_VIEWFINDER path) --- */
+
+int
+gp_iccamera_liveview_start(gp_iccamera *icc, char *status, int statuslen)
+{
+	PTPParams          *params = &icc->camera->pl->params;
+	PTPDevicePropDesc   dpd;
+	PTPPropValue        val;
+	uint16_t            r;
+	char               *sp = status; int sl = statuslen;
+#define SLOG(...) do { int _n = snprintf(sp, (size_t)sl, __VA_ARGS__); if (_n > 0 && _n < sl) { sp += _n; sl -= _n; } } while (0)
+
+	if (status && statuslen) status[0] = 0;
+
+	/* EVF must be on; only set when off (setting it every time costs seconds). */
+	memset(&dpd, 0, sizeof(dpd));
+	r = ptp_canon_eos_getdevicepropdesc(params, PTP_DPC_CANON_EOS_EVFMode, &dpd);
+	if (r == PTP_RC_OK && dpd.CurrentValue.u16 != 1) {
+		val.u16 = 1;
+		r = ptp_canon_eos_setdevicepropvalue(params, PTP_DPC_CANON_EOS_EVFMode, &val, PTP_DTC_UINT16);
+		if (r != PTP_RC_OK && r != PTP_RC_DeviceBusy) { SLOG("EVFMode=1 failed 0x%04x", r); ptp_free_devicepropdesc(&dpd); return -1; }
+	}
+	ptp_free_devicepropdesc(&dpd);
+
+	/* Route live view to BOTH the camera's own screen and the host. The value is a
+	 * bitmask (bit0 TFT = rear screen, bit1 PC, bit2/3 MOBILE); config.c enumerates
+	 * 3 as "TFT + PC". PC alone (2) blanks the camera screen, so we OR in the TFT bit.
+	 * Only write when TFT+PC aren't already both up, to avoid a re-set stall. */
+	memset(&dpd, 0, sizeof(dpd));
+	r = ptp_canon_eos_getdevicepropdesc(params, PTP_DPC_CANON_EOS_EVFOutputDevice, &dpd);
+	if (r == PTP_RC_OK && (dpd.CurrentValue.u32 & 3u) != 3u) {
+		val.u32 = dpd.CurrentValue.u32 | 3u;   /* TFT + PC (keep any MOBILE bits already set) */
+		r = ptp_canon_eos_setdevicepropvalue(params, PTP_DPC_CANON_EOS_EVFOutputDevice, &val, PTP_DTC_UINT32);
+		if (r != PTP_RC_OK) { SLOG("EVFOutputDevice=TFT+PC failed 0x%04x", r); ptp_free_devicepropdesc(&dpd); return -2; }
+	}
+	ptp_free_devicepropdesc(&dpd);
+
+	ptp_canon_eos_keepdeviceon(params);   /* else the body auto-shuts-down mid-stream */
+	params->inliveview = 1;
+	SLOG("live view on");
+	return 0;
+#undef SLOG
+}
+
+int
+gp_iccamera_liveview_frame(gp_iccamera *icc, uint8_t **outdata, int *outlen)
+{
+	PTPParams     *params = &icc->camera->pl->params;
+	unsigned char *data = NULL, *xdata;
+	unsigned int   size = 0;
+	uint16_t       r;
+	int            tries;
+
+	*outdata = NULL; *outlen = 0;
+
+	/* one event poll per frame (do NOT drain the queue — library.c does the same) */
+	ptp_check_eos_events(params);
+
+	/* "not ready" (0xA102) right after enabling is normal; retry briefly (~300ms). */
+	for (tries = 0; ; tries++) {
+		r = ptp_canon_eos_get_viewfinder_image(params, &data, &size);
+		if ((r == PTP_RC_CANON_EOS_ObjectNotReady || r == PTP_RC_DeviceBusy) && tries < 6) {
+			usleep(50 * 1000);
+			continue;
+		}
+		break;
+	}
+	if (r == PTP_RC_CANON_EOS_ObjectNotReady || r == PTP_RC_DeviceBusy) return 1;  /* soft: try next tick */
+	if (r != PTP_RC_OK) return -1;
+	if (!data || size < 8) { if (data) free(data); return 1; }
+
+	/* The buffer is a sequence of blobs: [u32 len][u32 type][payload len-8].
+	 * type 1/11 = JPEG preview, 9 = movie-mode frame. First frame blob wins. */
+	xdata = data;
+	while ((size_t)(xdata - data) + 8 <= size) {
+		uint32_t len  = get32(xdata);
+		uint32_t type = get32(xdata + 4);
+		if (len < 8 || len > size - (uint32_t)(xdata - data)) break;   /* malformed */
+		if (type == 1 || type == 9 || type == 11) {
+			uint32_t jlen = len - 8;
+			uint8_t *jpg  = malloc(jlen);
+			if (!jpg) { free(data); return -2; }
+			memcpy(jpg, xdata + 8, jlen);
+			free(data);
+			*outdata = jpg; *outlen = (int)jlen;
+			return 0;
+		}
+		xdata += len;
+	}
+	free(data);
+	return 1;   /* no frame blob this round */
+}
+
+int
+gp_iccamera_liveview_stop(gp_iccamera *icc)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	if (!params->inliveview) return 0;
+	params->inliveview = 0;
+	return ptp_canon_eos_end_viewfinder(params) == PTP_RC_OK ? 0 : -1;
+}
+
+/* --- Canon EOS commands (EDSDK-equivalent). See EDSDK-CAPABILITY-MAP.md. --- */
+
+int
+gp_iccamera_af(gp_iccamera *icc, int on)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = on ? ptp_canon_eos_afdrive(params) : ptp_canon_eos_afcancel(params);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_bulb(gp_iccamera *icc, int start)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r;
+	if (start) {
+		ptp_canon_eos_setremotemode(params, 1);
+		params->eos_captureenabled = 1;
+		r = ptp_canon_eos_bulbstart(params);
+	} else {
+		r = ptp_canon_eos_bulbend(params);
+	}
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_drivelens(gp_iccamera *icc, int amount)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_canon_eos_drivelens(params, (uint32_t)amount);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_uilock(gp_iccamera *icc, int lock)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = lock ? ptp_canon_eos_setuilock(params) : ptp_canon_eos_resetuilock(params);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_evf_zoom(gp_iccamera *icc, int zoom)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_canon_eos_zoom(params, (uint32_t)zoom);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_evf_zoomposition(gp_iccamera *icc, int x, int y)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_canon_eos_zoomposition(params, (uint32_t)x, (uint32_t)y);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_dof_preview(gp_iccamera *icc, int on)
+{
+	PTPParams   *params = &icc->camera->pl->params;
+	PTPPropValue val;
+	val.u32 = on ? 1 : 0;
+	uint16_t r = ptp_canon_eos_setdevicepropvalue(params, PTP_DPC_CANON_EOS_DepthOfFieldPreview, &val, PTP_DTC_UINT32);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_popupflash(gp_iccamera *icc)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_canon_eos_popupflash(params);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_rollpitch(gp_iccamera *icc, int on)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_canon_eos_setrequestrollingpitchinglevel(params, (uint32_t)(on ? 1 : 0));
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+/* --- Event-driven update: drain the one Canon EOS event queue (EDSDK property/object/state
+ * events all land here) and summarise what changed. See EDSDK-CAPABILITY-MAP.md step 3. --- */
+int
+gp_iccamera_poll_events(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams        *params = &icc->camera->pl->params;
+	PTPCanonEOSEvent  ev;
+	int               n = 0;
+	char             *sp = out; int sl = outlen;
+
+	if (out && outlen) out[0] = 0;
+	if (params->deviceinfo.VendorExtensionID != PTP_VENDOR_CANON) return 0;
+	if (ptp_check_eos_events(params) != PTP_RC_OK) return -1;
+
+	while (ptp_get_one_eos_event(params, &ev)) {
+		int w = 0;
+		switch (ev.type) {
+		case PTP_EOSEvent_PropertyChanged:
+			w = snprintf(sp, (size_t)sl, "PROP %04x\n", ev.u.propid);
+			break;
+		case PTP_EOSEvent_ObjectAdded:      /* new file on card (SaveTo=card) */
+		case PTP_EOSEvent_ObjectTransfer:   /* camera asks host to pull it (SaveTo=host) */
+			w = snprintf(sp, (size_t)sl, "OBJECT %08x %04x %llu\n",
+			             ev.u.object.Handle, ev.u.object.ObjectFormat,
+			             (unsigned long long)ev.u.object.ObjectSize);
+			break;
+		case PTP_EOSEvent_ObjectRemoved:
+			w = snprintf(sp, (size_t)sl, "OBJECTREMOVED\n");
+			break;
+		case PTP_EOSEvent_CameraStatus:
+			w = snprintf(sp, (size_t)sl, "STATUS %d\n", ev.u.status);
+			break;
+		case PTP_EOSEvent_FocusInfo:
+			w = snprintf(sp, (size_t)sl, "FOCUS\n");
+			break;
+		default:
+			w = 0;
+			break;
+		}
+		if (w > 0 && w < sl) { sp += w; sl -= w; }
+		ptp_free_eos_event(&ev);
+		n++;
+	}
+	return n;
+}
+
+/* Download one object by handle (auto-pull a body-triggered shot). Mirrors capture()'s
+ * download step so the verified capture path is left untouched. */
+int
+gp_iccamera_download(gp_iccamera *icc, uint32_t handle, uint32_t fmt, uint32_t size,
+                     uint8_t **outdata, int *outlen, char *ext, int extlen,
+                     char *status, int statuslen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t   r;
+	char      *sp = status; int sl = statuslen;
+#define SLOG(...) do { int _n = snprintf(sp, (size_t)sl, __VA_ARGS__); if (_n > 0 && _n < sl) { sp += _n; sl -= _n; } } while (0)
+
+	*outdata = NULL; *outlen = 0;
+	if (status && statuslen) status[0] = 0;
+	if (ext && extlen) {
+		if (fmt == PTP_OFC_CANON_CR3) snprintf(ext, (size_t)extlen, "cr3");
+		else if (fmt == PTP_OFC_CANON_CRW || fmt == PTP_OFC_CANON_CRW3) snprintf(ext, (size_t)extlen, "cr2");
+		else snprintf(ext, (size_t)extlen, "jpg");
+	}
+
+	if (size == 0) {   /* unknown size: one big read, use whatever comes back */
+		unsigned char *chunk = NULL; uint32_t got = 0x0fffffff;
+		r = ptp_getpartialobject(params, handle, 0, got, &chunk, &got);
+		if (r != PTP_RC_OK || !chunk) { SLOG("getobject failed 0x%04x", r); return -1; }
+		ptp_canon_eos_transfercomplete(params, handle);
+		*outdata = chunk; *outlen = (int)got;
+		SLOG("downloaded %u bytes", got);
+		return 0;
+	}
+
+	{
+		uint32_t total = size, offset = 0;
+		uint8_t *buf = malloc(total);
+		if (!buf) { SLOG("out of memory (%u)", total); return -2; }
+		while (offset < total) {
+			unsigned char *chunk = NULL;
+			uint32_t want = total - offset;
+			if (want > (1u << 20)) want = (1u << 20);
+			r = ptp_getpartialobject(params, handle, offset, want, &chunk, &want);
+			if (r != PTP_RC_OK || !chunk) { SLOG("getpartialobject@%u failed 0x%04x", offset, r); free(buf); return -1; }
+			memcpy(buf + offset, chunk, want);
+			free(chunk);
+			if (want == 0) break;
+			offset += want;
+		}
+		ptp_canon_eos_transfercomplete(params, handle);
+		*outdata = buf; *outlen = (int)offset;
+		SLOG("downloaded %d bytes", (int)offset);
+	}
+	return 0;
+#undef SLOG
+}
+
+int
+gp_iccamera_keepalive(gp_iccamera *icc)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	return ptp_canon_eos_keepdeviceon(params) == PTP_RC_OK ? 0 : -1;
 }
 
 int

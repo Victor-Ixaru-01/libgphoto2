@@ -85,6 +85,51 @@ int gp_iccamera_get_config(gp_iccamera *, const char *name,
                            char *value, int vlen, char *choices, int clen);
 int gp_iccamera_set_config(gp_iccamera *, const char *name, const char *value);
 
+/* Canon EOS live view (streamed EVF frames).
+ *   _start  → route the EVF to "PC" and enter live-view mode (call once). Writes a
+ *             human trace to `status`. Returns 0 on success, negative on failure.
+ *   _frame  → fetch ONE JPEG preview frame. Returns 0 and sets *outdata (malloc'd —
+ *             free with gp_iccamera_freebuf) + *outlen on success; returns 1 (soft)
+ *             when no frame is ready yet — just call again; negative on hard error.
+ *   _stop   → leave live-view mode.
+ * Call all three from a BACKGROUND thread, like the other gp_iccamera_* ops. */
+int gp_iccamera_liveview_start(gp_iccamera *, char *status, int statuslen);
+int gp_iccamera_liveview_frame(gp_iccamera *, uint8_t **outdata, int *outlen);
+int gp_iccamera_liveview_stop (gp_iccamera *);
+
+/* Canon EOS commands (EDSDK-equivalent) — thin wrappers over ptp_canon_eos_* ops.
+ * Each returns 0 on success or a negative code. Call from a BACKGROUND thread.
+ * See docs-architecture/EDSDK-CAPABILITY-MAP.md for the full EDSDK→ptp2 mapping. */
+int gp_iccamera_af             (gp_iccamera *, int on);         /* EdsCommand DoEvfAf: afdrive / afcancel */
+int gp_iccamera_bulb           (gp_iccamera *, int start);      /* BulbStart / BulbEnd */
+int gp_iccamera_drivelens      (gp_iccamera *, int amount);     /* DriveLensEvf: 1..3 near, 0x8001..0x8003 far */
+int gp_iccamera_uilock         (gp_iccamera *, int lock);       /* StatusCommand UILock / UIUnLock */
+int gp_iccamera_evf_zoom       (gp_iccamera *, int zoom);       /* EVF Zoom: 1 fit, 5, 6, 10, 15 */
+int gp_iccamera_evf_zoomposition(gp_iccamera *, int x, int y);  /* EVF zoom rect top-left */
+int gp_iccamera_dof_preview    (gp_iccamera *, int on);         /* Evf_DepthOfFieldPreview */
+int gp_iccamera_popupflash     (gp_iccamera *);                 /* pop up the built-in flash */
+int gp_iccamera_rollpitch      (gp_iccamera *, int on);         /* RequestRollPitchLevel */
+
+/* Drain the Canon EOS event queue once — the EDSDK property/object/state events all arrive
+ * on this single queue. Writes a newline-separated summary of what was seen to `out`:
+ *   "PROP <hex>"                    a device property changed on the camera (drives "update")
+ *   "OBJECT <handle> <fmt> <size>"  a new image/object was created
+ *   "OBJECTREMOVED" | "STATUS <n>" | "FOCUS"
+ * Returns the number of events (0 = nothing happened), or negative on error. Background thread. */
+int gp_iccamera_poll_events(gp_iccamera *, char *out, int outlen);
+
+/* Download one object (image) by handle — used to auto-pull a shot triggered on the camera
+ * BODY when an OBJECT event arrives from poll_events. `fmt` and `size` come from that event
+ * line (size 0 = unknown → one big read). On success returns 0, sets *outdata (free with
+ * gp_iccamera_freebuf) + *outlen, writes the extension to `ext` and a trace to `status`.
+ * Negative on failure. Background thread. */
+int gp_iccamera_download(gp_iccamera *, uint32_t handle, uint32_t fmt, uint32_t size,
+                         uint8_t **outdata, int *outlen, char *ext, int extlen,
+                         char *status, int statuslen);
+
+/* Keep the camera awake (EDSDK ExtendShutDownTimer) — call on a camera-status event. */
+int gp_iccamera_keepalive(gp_iccamera *);
+
 #ifdef __cplusplus
 }
 #endif
