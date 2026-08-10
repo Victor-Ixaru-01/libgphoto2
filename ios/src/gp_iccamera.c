@@ -43,6 +43,20 @@ struct gp_iccamera {
 	int            indatalen;
 	unsigned char  resp[64];
 	int            resplen;
+
+	/* EVF coordinate system (record type 14), captured per live-view frame — the space
+	 * AF/zoom coordinates live in (e.g. 6000x4000 on the R50). Used to map screen taps. */
+	uint32_t       evf_coord_w, evf_coord_h;
+
+	/* EVF frame rect (record type 13) — the movable zoom/AF box; candidate AF-reticle source
+	 * when FocusInfoEx (0xD1D3) isn't reported. Coordinates in the type-14 space. */
+	int32_t        evf_frame_x, evf_frame_y, evf_frame_w, evf_frame_h;
+	int            evf_frame_valid;
+
+	/* Roll/pitch level from EVF record type 16 (offsets 8/12): roll x100, pitch x100,
+	 * each mod 36000 (>18000 means negative). */
+	uint32_t       evf_level_a, evf_level_b;
+	int            evf_level_valid;
 };
 
 /* --- little-endian helpers --- */
@@ -560,15 +574,18 @@ gp_iccamera_liveview_start(gp_iccamera *icc, char *status, int statuslen)
 }
 
 int
-gp_iccamera_liveview_frame(gp_iccamera *icc, uint8_t **outdata, int *outlen)
+gp_iccamera_liveview_frame(gp_iccamera *icc, uint8_t **outdata, int *outlen,
+                           uint32_t *hist, int histcap, int *histn)
 {
 	PTPParams     *params = &icc->camera->pl->params;
 	unsigned char *data = NULL, *xdata;
 	unsigned int   size = 0;
 	uint16_t       r;
-	int            tries;
+	int            tries, hn = 0;
+	uint8_t       *jpg = NULL; uint32_t jlen = 0;
 
 	*outdata = NULL; *outlen = 0;
+	if (histn) *histn = 0;
 
 	/* one event poll per frame (do NOT drain the queue — library.c does the same) */
 	ptp_check_eos_events(params);
@@ -586,26 +603,93 @@ gp_iccamera_liveview_frame(gp_iccamera *icc, uint8_t **outdata, int *outlen)
 	if (r != PTP_RC_OK) return -1;
 	if (!data || size < 8) { if (data) free(data); return 1; }
 
-	/* The buffer is a sequence of blobs: [u32 len][u32 type][payload len-8].
-	 * type 1/11 = JPEG preview, 9 = movie-mode frame. First frame blob wins. */
+	/* The buffer is a sequence of records: [u32 len][u32 type][payload len-8].
+	 * type 1/11 = JPEG preview, 9 = movie-mode frame (first one wins). The histogram
+	 * rides in the same buffer as 256-bucket uint32 channels (1024 bytes each, EDSDK
+	 * layout; a combined 4096-byte record is split into 4) — identified by size, since
+	 * ptp2 doesn't name the record type. See gp_iccamera_liveview_inspect for discovery. */
 	xdata = data;
 	while ((size_t)(xdata - data) + 8 <= size) {
 		uint32_t len  = get32(xdata);
 		uint32_t type = get32(xdata + 4);
+		uint32_t plen;
+		const uint8_t *payload;
 		if (len < 8 || len > size - (uint32_t)(xdata - data)) break;   /* malformed */
-		if (type == 1 || type == 9 || type == 11) {
-			uint32_t jlen = len - 8;
-			uint8_t *jpg  = malloc(jlen);
-			if (!jpg) { free(data); return -2; }
-			memcpy(jpg, xdata + 8, jlen);
-			free(data);
-			*outdata = jpg; *outlen = (int)jlen;
-			return 0;
+		plen = len - 8;
+		payload = xdata + 8;
+
+		if (!jpg && (type == 1 || type == 9 || type == 11)) {
+			jpg = malloc(plen);
+			if (jpg) { memcpy(jpg, payload, plen); jlen = plen; }
+		} else if (type == 17 && plen >= 1024) {   /* histogram: 4 x 256 x u32 (RGBY) */
+			if (hist && histcap > 0) {
+				uint32_t nvals = plen / 4, k;
+				for (k = 0; k < nvals && hn < histcap; k++)
+					hist[hn++] = get32(payload + k * 4);
+			}
+		} else if (type == 14 && plen >= 8) {       /* coordinate system size (WxH) */
+			icc->evf_coord_w = get32(payload);
+			icc->evf_coord_h = get32(payload + 4);
+		} else if (type == 13 && plen >= 16) {      /* movable zoom/AF frame rect */
+			icc->evf_frame_x = (int32_t)get32(payload);
+			icc->evf_frame_y = (int32_t)get32(payload + 4);
+			icc->evf_frame_w = (int32_t)get32(payload + 8);
+			icc->evf_frame_h = (int32_t)get32(payload + 12);
+			icc->evf_frame_valid = 1;
+		} else if (type == 16 && plen >= 16) {      /* roll/pitch level: [2][0][roll*100][pitch*100] */
+			icc->evf_level_a = get32(payload + 8);   /* roll  x100 (mod 36000) */
+			icc->evf_level_b = get32(payload + 12);  /* pitch x100 (mod 36000) */
+			icc->evf_level_valid = 1;
 		}
 		xdata += len;
 	}
 	free(data);
-	return 1;   /* no frame blob this round */
+	if (histn) *histn = hn;
+
+	if (jpg && jlen > 0) { *outdata = jpg; *outlen = (int)jlen; return 0; }
+	if (jpg) free(jpg);
+	return 1;   /* no JPEG this round (histn may still be set) */
+}
+
+int
+gp_iccamera_liveview_inspect(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams     *params = &icc->camera->pl->params;
+	unsigned char *data = NULL, *xdata;
+	unsigned int   size = 0;
+	uint16_t       r;
+	int            n = 0;
+	char *sp = out; int sl = outlen;
+
+	if (out && outlen) out[0] = 0;
+	ptp_check_eos_events(params);
+	r = ptp_canon_eos_get_viewfinder_image(params, &data, &size);
+	if (r != PTP_RC_OK || !data) { if (data) free(data); return (r == PTP_RC_OK) ? 0 : -1; }
+
+	xdata = data;
+	while ((size_t)(xdata - data) + 8 <= size) {
+		uint32_t len  = get32(xdata);
+		uint32_t type = get32(xdata + 4);
+		uint32_t plen, show, b;
+		int w;
+		if (len < 8 || len > size - (uint32_t)(xdata - data)) break;
+		plen = len - 8;
+		w = snprintf(sp, (size_t)sl, "type=%u len=%u ", type, plen);
+		if (w > 0 && w < sl) { sp += w; sl -= w; }
+		/* dump up to 64 bytes (deeper than ptp_bytes2str's 16) so values buried in the larger
+		 * records — e.g. roll/pitch — are visible; JPEG/histogram are just truncated harmlessly */
+		show = plen < 64 ? plen : 64;
+		for (b = 0; b < show; b++) {
+			w = snprintf(sp, (size_t)sl, "%02x ", ((const uint8_t *)(xdata + 8))[b]);
+			if (w > 0 && w < sl) { sp += w; sl -= w; } else break;
+		}
+		w = snprintf(sp, (size_t)sl, "\n");
+		if (w > 0 && w < sl) { sp += w; sl -= w; }
+		xdata += len;
+		n++;
+	}
+	free(data);
+	return n;
 }
 
 int
@@ -615,6 +699,84 @@ gp_iccamera_liveview_stop(gp_iccamera *icc)
 	if (!params->inliveview) return 0;
 	params->inliveview = 0;
 	return ptp_canon_eos_end_viewfinder(params) == PTP_RC_OK ? 0 : -1;
+}
+
+/* EVF coordinate-system size (record type 14), captured by the last liveview_frame. 0 until a
+ * frame has been fetched. This is the space AF frames / touch-AF points are expressed in. */
+int
+gp_iccamera_get_coordsize(gp_iccamera *icc, uint32_t *w, uint32_t *h)
+{
+	if (w) *w = icc->evf_coord_w;
+	if (h) *h = icc->evf_coord_h;
+	return (icc->evf_coord_w && icc->evf_coord_h) ? 0 : -1;
+}
+
+/* EVF frame rect (record type 13) from the last live-view frame — the movable zoom/AF box, in
+ * the type-14 coordinate space. Candidate AF reticle when FocusInfoEx isn't reported. 0/-1. */
+int
+gp_iccamera_get_evf_frame(gp_iccamera *icc, int *x, int *y, int *w, int *h)
+{
+	if (!icc->evf_frame_valid) return -1;
+	if (x) *x = icc->evf_frame_x;
+	if (y) *y = icc->evf_frame_y;
+	if (w) *w = icc->evf_frame_w;
+	if (h) *h = icc->evf_frame_h;
+	return 0;
+}
+
+/* Roll/pitch level from the last live-view frame (EVF record type 16): *a = roll x100,
+ * *b = pitch x100 (each mod 36000; >18000 = negative). Returns 0 with values, or -1. */
+int
+gp_iccamera_get_level(gp_iccamera *icc, uint32_t *a, uint32_t *b)
+{
+	if (!icc->evf_level_valid) return -1;
+	if (a) *a = icc->evf_level_a;
+	if (b) *b = icc->evf_level_b;
+	return 0;
+}
+
+/* Read the selected AF reticles directly from FocusInfoEx (0xD1D3), bypassing config.c's
+ * widget gating (which needs the prop to be advertised). Prompts + drains, then returns the
+ * parsed "sizeX,sizeY,size2X,size2Y;{x,y,w,h},…" string. Returns 0 (string in `out`, may be
+ * empty) or -1 if the camera hasn't reported FocusInfoEx yet (needs live view / AF active). */
+int
+gp_iccamera_get_focusinfo(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams        *params = &icc->camera->pl->params;
+	PTPDevicePropDesc dpd;
+
+	if (out && outlen) out[0] = 0;
+	ptp_canon_eos_requestdevicepropvalue(params, PTP_DPC_CANON_EOS_FocusInfoEx);
+	ptp_check_eos_events(params);
+	memset(&dpd, 0, sizeof(dpd));
+	if (ptp_canon_eos_getdevicepropdesc(params, PTP_DPC_CANON_EOS_FocusInfoEx, &dpd) != PTP_RC_OK)
+		return -1;
+	if (dpd.DataType == PTP_DTC_STR && dpd.CurrentValue.str && out && outlen)
+		snprintf(out, (size_t)outlen, "%s", dpd.CurrentValue.str);
+	ptp_free_devicepropdesc(&dpd);
+	return 0;
+}
+
+/* Touch-AF: set the live-view AF frame to a point in the EVF coordinate space (0x915A, sends
+ * data). EXPERIMENTAL — ptp2 doesn't define this op's payload; first attempt sends the point as
+ * two LE uint32 (x,y). The PTP response code is written to `status` so the format can be
+ * verified/corrected on hardware. */
+int
+gp_iccamera_set_af_frame(gp_iccamera *icc, int x, int y, char *status, int statuslen)
+{
+	PTPParams    *params = &icc->camera->pl->params;
+	PTPContainer  ptp;
+	unsigned char buf[8], *data = buf;
+	uint16_t      r;
+
+	put32(buf + 0, (uint32_t)x);
+	put32(buf + 4, (uint32_t)y);
+	memset(&ptp, 0, sizeof(ptp));
+	ptp.Code = PTP_OC_CANON_EOS_SetLiveAfFrame;
+	ptp.Nparam = 0;
+	r = ptp_transaction(params, &ptp, PTP_DP_SENDDATA, sizeof(buf), &data, NULL);
+	if (status && statuslen) snprintf(status, (size_t)statuslen, "SetLiveAfFrame(%d,%d) → 0x%04x", x, y, r);
+	return r == PTP_RC_OK ? 0 : -1;
 }
 
 /* --- Canon EOS commands (EDSDK-equivalent). See EDSDK-CAPABILITY-MAP.md. --- */
@@ -697,6 +859,81 @@ gp_iccamera_rollpitch(gp_iccamera *icc, int on)
 {
 	PTPParams *params = &icc->camera->pl->params;
 	uint16_t r = ptp_canon_eos_setrequestrollingpitchinglevel(params, (uint32_t)(on ? 1 : 0));
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+int
+gp_iccamera_drive_powerzoom(gp_iccamera *icc, int mode)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t r = ptp_generic_no_data(params, PTP_OC_CANON_EOS_DrivePowerZoom, 1, (uint32_t)mode);
+	return r == PTP_RC_OK ? 0 : -1;
+}
+
+/* --- Generic Canon EOS device-property access (scalar props by code) --- */
+
+int
+gp_iccamera_get_eosprop(gp_iccamera *icc, uint16_t code, uint32_t *value, uint32_t *datatype,
+                        uint32_t *choices, int choicecap, int *nchoices)
+{
+	PTPParams        *params = &icc->camera->pl->params;
+	PTPDevicePropDesc dpd;
+
+	if (value)    *value = 0;
+	if (datatype) *datatype = 0;
+	if (nchoices) *nchoices = 0;
+
+	ptp_canon_eos_requestdevicepropvalue(params, code);   /* best-effort refresh */
+	ptp_check_eos_events(params);
+
+	memset(&dpd, 0, sizeof(dpd));
+	if (ptp_canon_eos_getdevicepropdesc(params, code, &dpd) != PTP_RC_OK)
+		return -1;
+
+	if (datatype) *datatype = dpd.DataType;
+	if (value) {
+		switch (dpd.DataType) {
+		case PTP_DTC_INT8:  case PTP_DTC_UINT8:  *value = dpd.CurrentValue.u8;  break;
+		case PTP_DTC_INT16: case PTP_DTC_UINT16: *value = dpd.CurrentValue.u16; break;
+		default:                                  *value = dpd.CurrentValue.u32; break;
+		}
+	}
+	if (choices && choicecap > 0 && (dpd.FormFlag & PTP_DPFF_Enumeration)) {
+		int n = dpd.FORM.Enum.NumberOfValues, i, w = 0;
+		for (i = 0; i < n && w < choicecap; i++) {
+			switch (dpd.DataType) {
+			case PTP_DTC_INT8:  case PTP_DTC_UINT8:  choices[w++] = dpd.FORM.Enum.SupportedValue[i].u8;  break;
+			case PTP_DTC_INT16: case PTP_DTC_UINT16: choices[w++] = dpd.FORM.Enum.SupportedValue[i].u16; break;
+			default:                                  choices[w++] = dpd.FORM.Enum.SupportedValue[i].u32; break;
+			}
+		}
+		if (nchoices) *nchoices = w;
+	}
+	ptp_free_devicepropdesc(&dpd);
+	return 0;
+}
+
+int
+gp_iccamera_set_eosprop(gp_iccamera *icc, uint16_t code, uint32_t value)
+{
+	PTPParams        *params = &icc->camera->pl->params;
+	PTPDevicePropDesc dpd;
+	PTPPropValue      val;
+	uint16_t          r, dt;
+
+	memset(&dpd, 0, sizeof(dpd));
+	if (ptp_canon_eos_getdevicepropdesc(params, code, &dpd) != PTP_RC_OK)
+		return -1;
+	dt = dpd.DataType;
+	ptp_free_devicepropdesc(&dpd);
+
+	memset(&val, 0, sizeof(val));
+	switch (dt) {
+	case PTP_DTC_INT8:  case PTP_DTC_UINT8:  val.u8  = (uint8_t)value;  break;
+	case PTP_DTC_INT16: case PTP_DTC_UINT16: val.u16 = (uint16_t)value; break;
+	default:                                  val.u32 = value;           break;
+	}
+	r = ptp_canon_eos_setdevicepropvalue(params, code, &val, dt);
 	return r == PTP_RC_OK ? 0 : -1;
 }
 

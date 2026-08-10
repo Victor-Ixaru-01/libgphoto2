@@ -1698,11 +1698,15 @@ ptp_unpack_EOS_FocusInfoEx (PTPParams* params, const unsigned char** data, uint3
 #endif
 
 	/* every selected focus_point gets an entry like "{N,N,N,N}," where N can be 5 chars long */
-	maxlen = 1 + focus_points_in_use * 26 + 2;
+	/* iOS: +48 for a "sizeX,sizeY,size2X,size2Y;" prefix so callers can normalise the rects */
+	maxlen = 48 + 1 + focus_points_in_use * 26 + 2;
 	str = (char*)malloc( maxlen );
 	if (!str)
 		return NULL;
 	p = str;
+
+	/* iOS: prepend the AF coordinate-space size (parsed above but otherwise only logged) */
+	p += sprintf(p, "%u,%u,%u,%u;", sizeX, sizeY, size2X, size2Y);
 
 	/* output only the selected AF-points, so no AF means you get an empty list: "{}" */
 	p += sprintf(p,"{");

@@ -91,11 +91,42 @@ int gp_iccamera_set_config(gp_iccamera *, const char *name, const char *value);
  *   _frame  → fetch ONE JPEG preview frame. Returns 0 and sets *outdata (malloc'd —
  *             free with gp_iccamera_freebuf) + *outlen on success; returns 1 (soft)
  *             when no frame is ready yet — just call again; negative on hard error.
+ *             `hist` (optional, `histcap` uint32s) also receives the histogram carried
+ *             in the same EVF buffer — 256-bucket uint32 channels (EDSDK layout), up to
+ *             4 (R,G,B,Y order TBD); *histn = number of values written (0 if none).
+ *             Pass hist=NULL / histcap=0 to skip.
  *   _stop   → leave live-view mode.
  * Call all three from a BACKGROUND thread, like the other gp_iccamera_* ops. */
 int gp_iccamera_liveview_start(gp_iccamera *, char *status, int statuslen);
-int gp_iccamera_liveview_frame(gp_iccamera *, uint8_t **outdata, int *outlen);
+int gp_iccamera_liveview_frame(gp_iccamera *, uint8_t **outdata, int *outlen,
+                               uint32_t *hist, int histcap, int *histn);
 int gp_iccamera_liveview_stop (gp_iccamera *);
+
+/* Fetch one EVF frame and list every sub-record (type, length, first bytes) to `out`, for
+ * discovering undocumented records (histogram layout, focus, zoom…). Returns the record
+ * count, or negative on error. Background thread; live view must be active. */
+int gp_iccamera_liveview_inspect(gp_iccamera *, char *out, int outlen);
+
+/* EVF coordinate-system size (from the last live-view frame) — the space AF/touch-AF points
+ * use (e.g. 6000x4000). Returns 0 with *w,*h set, or negative if not captured yet. */
+int gp_iccamera_get_coordsize(gp_iccamera *, uint32_t *w, uint32_t *h);
+
+/* Read FocusInfoEx (0xD1D3) directly as the "sizeX,sizeY,…;{x,y,w,h},…" string, bypassing the
+ * config-tree widget gating. 0 = string in `out` (may be empty); -1 = camera not reporting it
+ * yet (needs live view / AF active). */
+int gp_iccamera_get_focusinfo(gp_iccamera *, char *out, int outlen);
+
+/* EVF frame rect (record type 13) from the last live-view frame — movable zoom/AF box in the
+ * type-14 coordinate space. Candidate AF reticle when FocusInfoEx is silent. 0/-1. */
+int gp_iccamera_get_evf_frame(gp_iccamera *, int *x, int *y, int *w, int *h);
+
+/* Roll/pitch level (EVF record type 16): *a = roll x100, *b = pitch x100 (each mod 36000;
+ * >18000 = negative). Returns 0 with values set, or -1. */
+int gp_iccamera_get_level(gp_iccamera *, uint32_t *a, uint32_t *b);
+
+/* Touch-AF: set the live-view AF frame to (x,y) in the EVF coordinate space (opcode 0x915A).
+ * EXPERIMENTAL payload (x,y as 2x u32) — writes "SetLiveAfFrame(x,y) → 0x….." to `status`. */
+int gp_iccamera_set_af_frame(gp_iccamera *, int x, int y, char *status, int statuslen);
 
 /* Canon EOS commands (EDSDK-equivalent) — thin wrappers over ptp_canon_eos_* ops.
  * Each returns 0 on success or a negative code. Call from a BACKGROUND thread.
@@ -109,6 +140,20 @@ int gp_iccamera_evf_zoomposition(gp_iccamera *, int x, int y);  /* EVF zoom rect
 int gp_iccamera_dof_preview    (gp_iccamera *, int on);         /* Evf_DepthOfFieldPreview */
 int gp_iccamera_popupflash     (gp_iccamera *);                 /* pop up the built-in flash */
 int gp_iccamera_rollpitch      (gp_iccamera *, int on);         /* RequestRollPitchLevel */
+int gp_iccamera_drive_powerzoom(gp_iccamera *, int mode);       /* DrivePowerZoom: 0 stop,1 wide,2 tele,0x11/0x12 +limit */
+
+/* Generic Canon EOS device-property access by code (PTP_DPC_CANON_EOS_*), for the EVF/focus/
+ * zoom scalar props that have no dedicated wrapper (EVFSharpness, EVFWBMode, EVFColorTemp,
+ * EVFRecordStatus, PowerZoomPosition, FocusMode, LV_AF_EyeDetect, AFSelectFocusArea,
+ * RefocusState, DepthOfField, …).
+ *   get → refreshes (RequestDevicePropValue) then reads the cached desc; sets *value and,
+ *         optionally, *datatype and the enumerated *choices (up to choicecap, *nchoices set).
+ *   set → writes `value` using the property's own datatype.
+ * Return 0 on success, negative on failure. Background thread. Scalars only — struct props
+ * (FocusInfoEx) are not decoded here. */
+int gp_iccamera_get_eosprop(gp_iccamera *, uint16_t code, uint32_t *value, uint32_t *datatype,
+                            uint32_t *choices, int choicecap, int *nchoices);
+int gp_iccamera_set_eosprop(gp_iccamera *, uint16_t code, uint32_t value);
 
 /* Drain the Canon EOS event queue once — the EDSDK property/object/state events all arrive
  * on this single queue. Writes a newline-separated summary of what was seen to `out`:

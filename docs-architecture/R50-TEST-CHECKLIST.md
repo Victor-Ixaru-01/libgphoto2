@@ -56,7 +56,9 @@ ptp2 doesn't parse the level, so this run is to *find* how the camera sends it.
 - [ ] **The camera's own rear screen STAYS ON** during LV (the TFT+PC fix — this was the bug).
   - Fail: screen goes dark → `EVFOutputDevice=TFT+PC failed 0x…` in the log.
 - [ ] **EVF Zoom** Fit / 5× / 10× → `EVF zoom N ✓` and the feed zooms.
-- [ ] **Stop LV** → feed stops, camera returns to normal; no crash.
+- [ ] **Histogram** appears under the live feed and moves as the scene brightness changes.
+  - If it's **missing** while LV runs, tap **Inspect EVF** and read the `EVF records (N): type=… len=…` log — find the histogram record's size (likely 1024 or 4096) and report it so the parser's size heuristic can be corrected. Also note the channel count/order (R,G,B,Y?).
+- [ ] **Stop LV** → feed stops, histogram clears, camera returns to normal; no crash.
 
 ## 7. EVF AF Mode (step 5)
 - [ ] Change **afmethod** picker (Quick / Live / LiveFace / …) → `set afmethod = … ✓`; the AF-area mode changes on the camera.
