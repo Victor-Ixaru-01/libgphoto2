@@ -39,8 +39,17 @@ line and move on — most are independent.
 - [ ] **DoF** → `DoF preview on ✓` (aperture stops down — audible/visible).
 - [ ] **Flash ▲** → `popup flash ✓` (built-in flash pops, if present).
 - [ ] **UI Lock** then **Unlock** → `UI lock ✓` / `UI unlock ✓` (body controls freeze/thaw).
-- [ ] **Roll/Pitch** → `roll/pitch on ✓`.
 - [ ] **Lens Near / Far** (needs live view active) → `drive lens 0x2 ✓` / `0x8002 ✓` (focus shifts).
+
+## 5b. Roll/pitch level — discovery (electronic level)
+ptp2 doesn't parse the level, so this run is to *find* how the camera sends it.
+- [ ] Tap **Level: Off → On** → `roll/pitch on ✓`.
+- [ ] **Tilt/rotate the camera** slowly through level → watch the log for new lines:
+  - `RAW unknown EOS event 0x…, N bytes: …` (level as an unhandled event — note the code + how the bytes change with tilt), and/or
+  - `PROP <hex>` that fires only while tilting (level as a device prop — note the hex code).
+- [ ] Capture ~5–10 of those lines at different angles (level, tilted left, tilted forward) so the byte↔angle mapping is clear.
+- [ ] Tap **Level: On → Off** when done.
+  - Report the `RAW`/`PROP` lines back → I parse `EdsCameraPos` (4×int32: status/position/rolling/pitching) into a live value.
 
 ## 6. Live view (Phase 5)
 - [ ] **Live View** → stream appears after a brief spin-up (first ~1 s of `0xA102` "not ready" is normal).

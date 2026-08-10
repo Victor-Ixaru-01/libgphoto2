@@ -735,6 +735,12 @@ gp_iccamera_poll_events(gp_iccamera *icc, char *out, int outlen)
 		case PTP_EOSEvent_FocusInfo:
 			w = snprintf(sp, (size_t)sl, "FOCUS\n");
 			break;
+		case PTP_EOSEvent_Unknown:
+			/* Debug surface: unhandled events carry a human string in u.info
+			 * (code + raw hex bytes) — used to discover roll/pitch level, etc. */
+			if (ev.u.info[0])
+				w = snprintf(sp, (size_t)sl, "RAW %s\n", ev.u.info);
+			break;
 		default:
 			w = 0;
 			break;

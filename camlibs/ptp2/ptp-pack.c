@@ -2667,6 +2667,12 @@ static unsigned int olcsizes[0x15][13] = {
 #undef XX
 			default:
 				ptp_debug (params, "%s unknown EOS event", prefix);
+				/* iOS patch: keep the code + raw bytes on the event so the app can
+				 * surface them for discovery (e.g. roll/pitch level). ptp_bytes2str
+				 * self-caps at 16 bytes; PTP_CANON_SET_INFO bounds into info[84]. */
+				PTP_CANON_SET_INFO(e[i], "unknown EOS event 0x%04x, %u bytes: %s",
+					(unsigned int)ec, (unsigned int)size,
+					(size > 8) ? ptp_bytes2str(curdata + 8, (int)(size - 8), "%02x ") : "");
 				break;
 			}
 			if (size >= 0x8) {	/* event info */
