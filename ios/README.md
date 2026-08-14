@@ -51,7 +51,8 @@ info-list, log, portability, result, locking — but **no iolib backends**), and
 | `include/ltdl.h` | Drop-in replacement for libtool's `<ltdl.h>` (static loader API). |
 | `src/ltdl_static.c` | The static module registry backing `lt_dlopenext`/`lt_dlsym`/`lt_dlforeachfile`. |
 | `src/gp_ios_register.{c,h}` | Registers the `ptp2` camlib at startup. **Call `gp_ios_register_all()` once before any `gp_*_load`/`gp_camera_init`.** |
-| `src/smoke_test.c` | Native validation harness. |
+| `src/gp_canon_imagesize.{c,h}` | Canon size-class → pixel dimensions (`RAW`/`cRAW`/`L`/…, per body + aspect). Pure C, no camera handle. See [../docs-architecture/canon-imagesize-resolver.md](../docs-architecture/canon-imagesize-resolver.md). |
+| `src/smoke_test.c` | Native validation harness (includes the image-size resolver checks). |
 | (generated) `../libgphoto2/gphoto2-endian.h` | From the `.in`, all-`#undef` → the portable little-endian path. |
 
 ## Integrating into an app (preview of Phase 2)
@@ -68,6 +69,10 @@ info-list, log, portability, result, locking — but **no iolib backends**), and
 At that point `gp_camera_init` → the ptp2 Canon EOS stack runs on top of the transport,
 giving you the full config tree / capture / live-view engine documented in
 [../docs-architecture/canon-cameras.md](../docs-architecture/canon-cameras.md).
+
+To turn an `imageformat` value (`RAW`/`cRAW`/`L`/`cRAW + L`/…) into megapixels/pixel
+dimensions in Swift, see
+[../docs-architecture/canon-imagesize-resolver.md](../docs-architecture/canon-imagesize-resolver.md).
 
 ## Notes
 
