@@ -4311,6 +4311,12 @@ struct _PTPParams {
 	int			canon_viewfinder_on;
 	int			canon_event_mode;
 
+	/* PTP: Canon EOS ImageFormat non-RAW file type as last reported by the camera
+	 * (1 == JPG, something else == HEIF while HDR PQ is on). The condensed uint16 the
+	 * ImageFormat property is mapped to has no room for it, so it is remembered here
+	 * to be written back unchanged. 0 == nothing seen yet. */
+	uint32_t		canon_eos_nonraw_filetype;
+
 	/* PTP: Canon EOS event queue */
 	PTPCanonEOSEvents	eos_events;
 	int			eos_captureenabled;

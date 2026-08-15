@@ -3150,9 +3150,12 @@ static struct deviceproptableu8 canon_eos_single_ImageFormats[] = {
 	/* user/custom compression, e.g. R5m2 */
 	{ N_("L"),    0x00, 0 },
 	{ N_("M"),    0x10, 0 },
-	{ N_("S1"),   0xe0, 0 },
-	{ N_("S2"),   0xd0, 0 },
+	{ N_("S1"),   0xd0, 0 },
+	{ N_("S2"),   0xe0, 0 },
 };
+
+/* "cRAW" + " + " + "cRAW" + NUL, unknown values render as "0xNN" and are not longer */
+#define EOS_IMAGEFORMAT_LABEL_LEN 12
 
 static const char*
 _single_EOS_ImageFormat_name(uint8_t val)
@@ -3165,10 +3168,30 @@ _single_EOS_ImageFormat_name(uint8_t val)
 	return buf;
 }
 
+/* Render the condensed uint16 as the label shown to the user, e.g. "cRAW + L". This is the
+ * only place where a value is turned into a label, _put_ matches against it to make sure the
+ * choice list and the reverse lookup can not disagree. */
+static void
+_EOS_ImageFormat_label (uint16_t value, char *buf, size_t bufsize)
+{
+	uint8_t val1 = (value >> 8) & 0xFF;
+	uint8_t val2 = (value >> 0) & 0xFF;
+	size_t  len;
+
+	/* _single_EOS_ImageFormat_name() returns a shared static buffer for unknown values,
+	 * so the first name has to be consumed before asking for the second one. */
+	snprintf (buf, bufsize, "%s", _single_EOS_ImageFormat_name (val1));
+	if (val2 == 0xFF)
+		return;
+	len = strlen (buf);
+	snprintf (buf + len, bufsize - len, " + %s", _single_EOS_ImageFormat_name (val2));
+}
+
 static int
 _get_Canon_EOS_ImageFormat(CONFIG_GET_ARGS)
 {
-	int defaultset = 0;
+	int  defaultset = 0;
+	char buf[EOS_IMAGEFORMAT_LABEL_LEN];
 
 	gp_widget_new (GP_WIDGET_RADIO, _(menu->label), widget);
 	gp_widget_set_name (*widget, menu->name);
@@ -3180,17 +3203,8 @@ _get_Canon_EOS_ImageFormat(CONFIG_GET_ARGS)
 	if (dpd->FormFlag == PTP_DPFF_Enumeration) {
 		for (unsigned i = 0; i < dpd->FORM.Enum.NumberOfValues; i++) {
 			uint16_t val =  dpd->FORM.Enum.SupportedValue[i].u16;
-			uint8_t val1 = (val >> 8) & 0xFF;
-			uint8_t val2 = (val >> 0) & 0xFF;
 
-			const char* name1 = _single_EOS_ImageFormat_name(val1);
-			const char* name2 = _single_EOS_ImageFormat_name(val2);
-
-			char buf[12] = { 0 };
-			strcpy (buf, name1);
-			if (val2 != 0xFF)
-				sprintf (buf + strlen(buf), " + %s", name2);
-
+			_EOS_ImageFormat_label (val, buf, sizeof(buf));
 			gp_widget_add_choice (*widget, buf);
 
 			if (val == dpd->CurrentValue.u16) {
@@ -3200,18 +3214,7 @@ _get_Canon_EOS_ImageFormat(CONFIG_GET_ARGS)
 		}
 	}
 	if (!defaultset) {
-		uint16_t val = dpd->CurrentValue.u16;
-		uint8_t val1 = (val >> 8) & 0xFF;
-		uint8_t val2 = (val >> 0) & 0xFF;
-
-		const char* name1 = _single_EOS_ImageFormat_name(val1);
-		const char* name2 = _single_EOS_ImageFormat_name(val2);
-
-		char buf[12] = { 0 };
-		strcpy (buf, name1);
-		if (val2 != 0xFF)
-			sprintf (buf + strlen(buf), " + %s", name2);
-
+		_EOS_ImageFormat_label (dpd->CurrentValue.u16, buf, sizeof(buf));
 		gp_widget_add_choice (*widget, buf);
 		gp_widget_set_value (*widget, buf);
 	}
@@ -3219,35 +3222,41 @@ _get_Canon_EOS_ImageFormat(CONFIG_GET_ARGS)
 	return GP_OK;
 }
 
-static uint8_t
-_single_EOS_ImageFormat_value(const char *name, size_t n, PTPDevicePropDesc *dpd)
-{
-	for (unsigned i = 0; i < ARRAYSIZE(canon_eos_single_ImageFormats); ++i)
-		if (strncmp (canon_eos_single_ImageFormats[i].label, name, n) == 0)
-			for (unsigned j = 0; j < dpd->FORM.Enum.NumberOfValues; ++j)
-				if (dpd->FORM.Enum.SupportedValue[j].u16 >> 8 == canon_eos_single_ImageFormats[i].value)
-					return canon_eos_single_ImageFormats[i].value;
-	return 0xFF;
-}
-
 static int
 _put_Canon_EOS_ImageFormat(CONFIG_PUT_ARGS) {
 	const char*	label;
+	char		buf[EOS_IMAGEFORMAT_LABEL_LEN];
+
 	gp_widget_get_value(widget, &label);
 
-	const char *sep = strstr(label, " + ");
-	size_t n = sep ? (size_t)(sep - label) : strlen(label);
+	/* Search the enumeration for the entry that renders to the requested label instead of
+	 * resolving the components separately: the same label can be produced by several values
+	 * (e.g. "L" is 0x03, 0x01 or 0x00 depending on the body's compression scheme), the JPEG
+	 * part of a dual format only ever appears in the low byte, and a combination assembled
+	 * from two independent lookups is not necessarily one the camera offers. */
+	if (dpd->FormFlag == PTP_DPFF_Enumeration) {
+		for (unsigned i = 0; i < dpd->FORM.Enum.NumberOfValues; ++i) {
+			uint16_t val = dpd->FORM.Enum.SupportedValue[i].u16;
 
-	uint8_t val1 = _single_EOS_ImageFormat_value(label, n, dpd);
-	uint8_t val2 = sep ? _single_EOS_ImageFormat_value(sep + 3, -1, dpd) : 0xFF;
-	if (val1 == 0xFF) {
-		GP_LOG_E("could not find '%s' in list of supported image formats", label);
-		return GP_ERROR_BAD_PARAMETERS;
+			_EOS_ImageFormat_label (val, buf, sizeof(buf));
+			if (strcmp (buf, label) == 0) {
+				propval->u16 = val;
+				GP_LOG_D("FOUND right value for %s in the enumeration at val %04x", label, val);
+				return GP_OK;
+			}
+		}
 	}
-	propval->u16 = val1 << 8 | val2;
-	GP_LOG_D("FOUND right value for %s in the enumeration at val %04x", label, propval->u16);
 
-	return GP_OK;
+	/* Without an enumeration _get_ offers the current value as the only choice (the camera
+	 * has not sent an AvailListChanged event for this property yet), accept it as a no-op. */
+	_EOS_ImageFormat_label (dpd->CurrentValue.u16, buf, sizeof(buf));
+	if (strcmp (buf, label) == 0) {
+		propval->u16 = dpd->CurrentValue.u16;
+		return GP_OK;
+	}
+
+	GP_LOG_E("could not find '%s' in list of supported image formats", label);
+	return GP_ERROR_BAD_PARAMETERS;
 }
 
 static struct deviceproptableu16 canon_eos_aeb[] = {

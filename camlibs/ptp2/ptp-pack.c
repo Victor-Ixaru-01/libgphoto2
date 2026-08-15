@@ -1475,6 +1475,7 @@ ptp_unpack_EOS_ImageFormat (PTPParams* params, const unsigned char** data, unsig
 		2: image type:
 			 1 == JPG
 			 6 == RAW
+			 other == HEIF (when HDR PQ is enabled it replaces the JPG type)
 		3: image size:
 			 0 == L
 			 1 == M
@@ -1503,7 +1504,10 @@ ptp_unpack_EOS_ImageFormat (PTPParams* params, const unsigned char** data, unsig
 
 	  * The S3 value (0xf) would overflow the nible, hence we decrease all S1,S2,S3 values by 1.
 	  * The to encode the type RAW, we set the 4th bit in the compression nible to 1 (|= 8).
-	  * To distinguish an "empty" second entry from the "custom L JPEG", we set it to 0xff.
+	  * An "empty" second entry (n == 1) is set to 0xff. Note that it can not be derived from
+	    the values alone: a "custom L JPEG" second entry is size 0 / compression 0, too.
+	  * The non-RAW type does not fit into the u16 at all, we remember it in the params (see
+	    below) so that packing can restore it instead of assuming JPG.
 
 	  The above example would result in the value 0x0bd2.
 	*/
@@ -1568,6 +1572,15 @@ ptp_unpack_EOS_ImageFormat (PTPParams* params, const unsigned char** data, unsig
 
 	*data += offset;
 
+	/* The condensed u16 only distinguishes RAW from "everything else", so remember the
+	 * non-RAW type to be able to write it back in ptp_pack_EOS_ImageFormat(). With HDR PQ
+	 * enabled the EOS bodies report HEIF here instead of JPG and reject a value that asks
+	 * for a JPG file. HDR PQ is a global mode, so the type is the same for all entries. */
+	if (t1 != 6 && t1 != 0)
+		params->canon_eos_nonraw_filetype = t1;
+	if (n == 2 && t2 != 6 && t2 != 0)
+		params->canon_eos_nonraw_filetype = t2;
+
 	/* deal with S1/S2/S3 JPEG sizes, see above. */
 	if( s1 >= 0xe )
 		s1--;
@@ -1578,7 +1591,9 @@ ptp_unpack_EOS_ImageFormat (PTPParams* params, const unsigned char** data, unsig
 	c1 |= (t1 == 6) ? 8 : 0;
 	c2 |= (t2 == 6) ? 8 : 0;
 
-	if (s2 == 0 && c2 == 0)
+	/* mark the second entry as empty -- only n tells us that it is, a real "custom L JPEG"
+	 * entry has size 0 and compression 0 as well */
+	if (n == 1)
 		s2 = c2 = 0xF;
 
 	return ((s1 & 0xF) << 12) | ((c1 & 0xF) << 8) | ((s2 & 0xF) << 4) | ((c2 & 0xF) << 0);
@@ -1593,18 +1608,22 @@ ptp_pack_EOS_ImageFormat (PTPParams* params, unsigned char* data, uint16_t value
 	if( !data )
 		return s;
 
+	/* the u16 has no room for the type, use the one the camera last reported (HEIF when
+	 * HDR PQ is on), see ptp_unpack_EOS_ImageFormat(). 0 == nothing seen yet, assume JPG. */
+	uint32_t nonraw = params->canon_eos_nonraw_filetype ? params->canon_eos_nonraw_filetype : 1;
+
 #define PACK_EOS_S123_JPEG_SIZE( X ) (X) >= 0xd ? (X)+1 : (X)
 
 	htod32a(data+=0, n);
 
 	htod32a(data+=4, 0x10);
-	htod32a(data+=4, value & 0x0800 ? 6 : 1);
+	htod32a(data+=4, value & 0x0800 ? 6 : nonraw);
 	htod32a(data+=4, PACK_EOS_S123_JPEG_SIZE((value >> 12) & 0xF));
 	htod32a(data+=4, (value >> 8) & 0x7);
 
 	if (n==2) {
 		htod32a(data+=4, 0x10);
-		htod32a(data+=4, value & 0x08 ? 6 : 1);
+		htod32a(data+=4, value & 0x08 ? 6 : nonraw);
 		htod32a(data+=4, PACK_EOS_S123_JPEG_SIZE((value >> 4) & 0xF));
 		htod32a(data+=4, (value >> 0) & 0x7);
 	}
