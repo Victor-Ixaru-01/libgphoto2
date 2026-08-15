@@ -46,7 +46,7 @@ PTP2_SRCS=(
   camlibs/ptp2/ptp.c camlibs/ptp2/library.c camlibs/ptp2/usb.c
   camlibs/ptp2/ptpip.c camlibs/ptp2/config.c camlibs/ptp2/chdk.c camlibs/ptp2/fujiptpip.c
 )
-SHIM_SRCS=( ios/src/ltdl_static.c ios/src/gp_ios_register.c ios/src/gp_iccamera.c ios/src/gp_canon_imagesize.c )
+SHIM_SRCS=( ios/src/ltdl_static.c ios/src/gp_ios_register.c ios/src/gp_iccamera.c ios/src/gp_canon_imagesize.c ios/src/gp_canon_moviesize.c )
 
 ALL_SRCS=( "${CORE_SRCS[@]}" "${PORT_SRCS[@]}" "${PTP2_SRCS[@]}" "${SHIM_SRCS[@]}" )
 
@@ -107,6 +107,7 @@ case "${1:-}" in
     cp "$ROOT"/ios/src/gp_ios_register.h "$HDR/"
     cp "$ROOT"/ios/src/gp_iccamera.h "$HDR/"
     cp "$ROOT"/ios/src/gp_canon_imagesize.h "$HDR/"
+    cp "$ROOT"/ios/src/gp_canon_moviesize.h "$HDR/"
     rm -rf "$OUT/libgphoto2.xcframework"
     xcodebuild -create-xcframework \
       -library "$OUT/ios/libgphoto2.a" -headers "$HDR" \

@@ -52,6 +52,7 @@ info-list, log, portability, result, locking — but **no iolib backends**), and
 | `src/ltdl_static.c` | The static module registry backing `lt_dlopenext`/`lt_dlsym`/`lt_dlforeachfile`. |
 | `src/gp_ios_register.{c,h}` | Registers the `ptp2` camlib at startup. **Call `gp_ios_register_all()` once before any `gp_*_load`/`gp_camera_init`.** |
 | `src/gp_canon_imagesize.{c,h}` | Canon size-class → pixel dimensions (`RAW`/`cRAW`/`L`/…, per body + aspect). Pure C, no camera handle. See [../docs-architecture/canon-imagesize-resolver.md](../docs-architecture/canon-imagesize-resolver.md). |
+| `src/gp_canon_moviesize.{c,h}` | Canon movie recording-size code → resolution + fps, per body (carrier prop + code table). Pure C. See [../docs-architecture/canon-movie-recording-size.md](../docs-architecture/canon-movie-recording-size.md). |
 | `src/smoke_test.c` | Native validation harness (includes the image-size resolver checks). |
 | (generated) `../libgphoto2/gphoto2-endian.h` | From the `.in`, all-`#undef` → the portable little-endian path. |
 
@@ -73,6 +74,18 @@ giving you the full config tree / capture / live-view engine documented in
 To turn an `imageformat` value (`RAW`/`cRAW`/`L`/`cRAW + L`/…) into megapixels/pixel
 dimensions in Swift, see
 [../docs-architecture/canon-imagesize-resolver.md](../docs-architecture/canon-imagesize-resolver.md).
+
+To detect the camera's photo ↔ video (movie) switch via `gp_iccamera_get_movie_mode()` and
+wire it to `poll_events`, see
+[../docs-architecture/canon-photo-video-mode.md](../docs-architecture/canon-photo-video-mode.md).
+
+To reverse-engineer movie resolution/framerate (not decoded upstream) with
+`gp_iccamera_movie_size_probe()`, `gp_iccamera_eos_props_dump()`, and
+`gp_iccamera_watch_prop_changes()`, see
+[../docs-architecture/canon-movie-size-probe-updated.md](../docs-architecture/canon-movie-size-probe-updated.md).
+The finding — movie recording size is property `0xD20D` (MovieParam5), now decoded — and how to
+read/set/watch it is in
+[../docs-architecture/canon-movie-recording-size.md](../docs-architecture/canon-movie-recording-size.md).
 
 ## Notes
 

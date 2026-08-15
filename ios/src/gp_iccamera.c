@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h>   /* usleep */
+#include <time.h>     /* clock_gettime */
 #if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
 #  include <iconv.h>
 #  include <langinfo.h>
@@ -26,6 +27,7 @@
 #include "ptp.h"
 #include "ptp-private.h"
 #include "gp_iccamera.h"
+#include "gp_canon_moviesize.h"
 
 struct gp_iccamera {
 	PTPData        ptpdata;   /* MUST be first: ptp2 reads (PTPData*)params->data */
@@ -735,6 +737,38 @@ gp_iccamera_get_level(gp_iccamera *icc, uint32_t *a, uint32_t *b)
 	return 0;
 }
 
+/* Normalize a raw level angle (x100, mod 36000) to signed centidegrees in (-18000, 18000]. */
+static int32_t
+icc_level_signed(uint32_t raw)
+{
+	int32_t v = (int32_t)(raw % 36000);
+	return v > 18000 ? v - 36000 : v;
+}
+
+/* Portrait/landscape from the roll of the last live-view frame's electronic level (record type
+ * 16). See gp_iccamera.h for the reliability caveat and the CW/CCW sign convention. */
+int
+gp_iccamera_get_orientation(gp_iccamera *icc, int *roll_deg, int *pitch_deg)
+{
+	int32_t roll, pitch, aroll;
+
+	if (roll_deg)  *roll_deg  = 0;
+	if (pitch_deg) *pitch_deg = 0;
+	if (!icc->evf_level_valid) return GP_ICCAMERA_ORIENTATION_UNKNOWN;
+
+	roll  = icc_level_signed(icc->evf_level_a);
+	pitch = icc_level_signed(icc->evf_level_b);
+	/* centidegrees → whole degrees, rounded to nearest */
+	if (roll_deg)  *roll_deg  = (roll  + (roll  >= 0 ? 50 : -50)) / 100;
+	if (pitch_deg) *pitch_deg = (pitch + (pitch >= 0 ? 50 : -50)) / 100;
+
+	aroll = roll < 0 ? -roll : roll;                            /* |roll| in centidegrees */
+	if (aroll <=  4500) return GP_ICCAMERA_ORIENTATION_LANDSCAPE;          /* within 45° of level */
+	if (aroll >= 13500) return GP_ICCAMERA_ORIENTATION_LANDSCAPE_INVERTED; /* within 45° of 180°  */
+	return roll > 0 ? GP_ICCAMERA_ORIENTATION_PORTRAIT_CW
+	                : GP_ICCAMERA_ORIENTATION_PORTRAIT_CCW;
+}
+
 /* Read the selected AF reticles directly from FocusInfoEx (0xD1D3), bypassing config.c's
  * widget gating (which needs the prop to be advertised). Prompts + drains, then returns the
  * parsed "sizeX,sizeY,size2X,size2Y;{x,y,w,h},…" string. Returns 0 (string in `out`, may be
@@ -935,6 +969,434 @@ gp_iccamera_set_eosprop(gp_iccamera *icc, uint16_t code, uint32_t value)
 	}
 	r = ptp_canon_eos_setdevicepropvalue(params, code, &val, dt);
 	return r == PTP_RC_OK ? 0 : -1;
+}
+
+/* Read one cached EOS devprop as an int after a best-effort refresh. Returns -1 if the
+ * property isn't exposed by this body (so callers can distinguish "photo" from "unknown"). */
+static int
+icc_read_eos_int(PTPParams *params, uint16_t code)
+{
+	PTPDevicePropDesc dpd;
+	int v = -1;
+
+	ptp_canon_eos_requestdevicepropvalue(params, code);   /* best-effort refresh */
+	ptp_check_eos_events(params);
+
+	memset(&dpd, 0, sizeof(dpd));
+	if (ptp_canon_eos_getdevicepropdesc(params, code, &dpd) != PTP_RC_OK)
+		return -1;
+	switch (dpd.DataType) {
+	case PTP_DTC_INT8:  case PTP_DTC_UINT8:  v = dpd.CurrentValue.u8;  break;
+	case PTP_DTC_INT16: case PTP_DTC_UINT16: v = dpd.CurrentValue.u16; break;
+	default:                                  v = (int)dpd.CurrentValue.u32; break;
+	}
+	ptp_free_devicepropdesc(&dpd);
+	return v;
+}
+
+int
+gp_iccamera_get_movie_mode(gp_iccamera *icc, int *raw_fixedmovie, int *raw_aemode)
+{
+	PTPParams *params = &icc->camera->pl->params;
+
+	/* Primary: the movie switch (0xD1C2, UINT32). Fallback/cross-check: AE mode (0xD105,
+	 * UINT16) whose value 0x14 == "Movie". Either is enough to declare VIDEO; if both read
+	 * and neither indicates movie, it's PHOTO; if neither reads at all, UNKNOWN. */
+	int fixedmovie = icc_read_eos_int(params, PTP_DPC_CANON_EOS_FixedMovie);
+	int aemode     = icc_read_eos_int(params, PTP_DPC_CANON_EOS_AutoExposureMode);
+
+	if (raw_fixedmovie) *raw_fixedmovie = fixedmovie;
+	if (raw_aemode)     *raw_aemode     = aemode;
+
+	if (fixedmovie > 0)               return GP_ICCAMERA_MOVIE_MODE_VIDEO;
+	if (aemode == 0x14)               return GP_ICCAMERA_MOVIE_MODE_VIDEO;   /* "Movie" */
+	if (fixedmovie == 0 || aemode >= 0)
+		return GP_ICCAMERA_MOVIE_MODE_PHOTO;
+	return GP_ICCAMERA_MOVIE_MODE_UNKNOWN;
+}
+
+/* --- Movie-size discovery probe (see gp_iccamera.h / canon-movie-size-probe.md) --- */
+
+static const char *
+icc_dtc_name(uint16_t dt)
+{
+	switch (dt) {
+	case PTP_DTC_INT8:   return "INT8";
+	case PTP_DTC_UINT8:  return "UINT8";
+	case PTP_DTC_INT16:  return "INT16";
+	case PTP_DTC_UINT16: return "UINT16";
+	case PTP_DTC_INT32:  return "INT32";
+	case PTP_DTC_UINT32: return "UINT32";
+	case PTP_DTC_STR:    return "STR";
+	default:             return "UNDEF/?";
+	}
+}
+
+static uint32_t
+icc_dpv_u32(uint16_t dt, PTPPropValue *v)
+{
+	switch (dt) {
+	case PTP_DTC_INT8:  case PTP_DTC_UINT8:  return v->u8;
+	case PTP_DTC_INT16: case PTP_DTC_UINT16: return v->u16;
+	default:                                  return v->u32;
+	}
+}
+
+int
+gp_iccamera_movie_size_probe(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	static const struct { uint16_t code; const char *name; } props[] = {
+		{ PTP_DPC_CANON_EOS_MovSize,                 "MovSize"     },
+		{ PTP_DPC_CANON_EOS_MovieParam,              "MovieParam"  },
+		{ PTP_DPC_CANON_EOS_MovieParam2,             "MovieParam2" },
+		{ PTP_DPC_CANON_EOS_MovieParam3,             "MovieParam3" },
+		{ PTP_DPC_CANON_EOS_MovieParam4,             "MovieParam4" },
+		{ PTP_DPC_CANON_EOS_MovieParam5,             "MovieParam5" },
+		{ PTP_DPC_CANON_EOS_VariableMovieRecSetting, "VarMovieRec" },
+	};
+	int off = 0;
+	unsigned p;
+
+	if (!out || outlen < 1)
+		return -1;
+	out[0] = '\0';
+
+	#define APPEND(...) do { \
+		if (off < outlen - 1) { \
+			int _w = snprintf(out + off, (size_t)(outlen - off), __VA_ARGS__); \
+			if (_w < 0)                    { /* encoding error: skip */ } \
+			else if (_w >= outlen - off)   off = outlen - 1;  /* truncated */ \
+			else                           off += _w; \
+		} \
+	} while (0)
+
+	for (p = 0; p < sizeof(props)/sizeof(props[0]); p++) {
+		PTPDevicePropDesc dpd;
+		uint16_t code = props[p].code;
+
+		ptp_canon_eos_requestdevicepropvalue(params, code);   /* best-effort refresh */
+		ptp_check_eos_events(params);
+
+		memset(&dpd, 0, sizeof(dpd));
+		if (ptp_canon_eos_getdevicepropdesc(params, code, &dpd) != PTP_RC_OK) {
+			APPEND("%04X %-11s  (not reported by this body)\n", code, props[p].name);
+			continue;
+		}
+
+		APPEND("%04X %-11s dt=%-6s %s cur=0x%08x",
+		       code, props[p].name, icc_dtc_name(dpd.DataType),
+		       dpd.GetSet == PTP_DPGS_GetSet ? "rw" : "ro",
+		       icc_dpv_u32(dpd.DataType, &dpd.CurrentValue));
+
+		if (dpd.FormFlag & PTP_DPFF_Enumeration) {
+			int n = dpd.FORM.Enum.NumberOfValues, i;
+			APPEND(" enum[%d]={", n);
+			for (i = 0; i < n; i++)
+				APPEND("%s0x%x", i ? "," : "",
+				       icc_dpv_u32(dpd.DataType, &dpd.FORM.Enum.SupportedValue[i]));
+			APPEND("}");
+		} else if (dpd.FormFlag & PTP_DPFF_Range) {
+			APPEND(" range=[0x%x..0x%x step 0x%x]",
+			       icc_dpv_u32(dpd.DataType, &dpd.FORM.Range.MinValue),
+			       icc_dpv_u32(dpd.DataType, &dpd.FORM.Range.MaxValue),
+			       icc_dpv_u32(dpd.DataType, &dpd.FORM.Range.StepSize));
+		} else {
+			APPEND(" (no form / single value)");
+		}
+		APPEND("\n");
+
+		ptp_free_devicepropdesc(&dpd);
+	}
+	#undef APPEND
+
+	return 0;
+}
+
+int
+gp_iccamera_eos_props_dump(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	int off = 0;
+
+	if (!out || outlen < 1)
+		return -1;
+	out[0] = '\0';
+
+	ptp_check_eos_events(params);   /* fold in any pending events so the cache is current */
+
+	/* Stable, code-sorted output makes before/after diffs clean. */
+	enum { CAP = 512 };
+	unsigned idx[CAP];
+	unsigned n = params->canon_props.len;
+	if (n > CAP) n = CAP;
+	for (unsigned i = 0; i < n; i++) idx[i] = i;
+	for (unsigned i = 0; i < n; i++)
+		for (unsigned j = i + 1; j < n; j++)
+			if (params->canon_props.val[idx[j]].DevicePropCode <
+			    params->canon_props.val[idx[i]].DevicePropCode) {
+				unsigned t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+			}
+
+	#define APPEND(...) do { \
+		if (off < outlen - 1) { \
+			int _w = snprintf(out + off, (size_t)(outlen - off), __VA_ARGS__); \
+			if (_w < 0)                  { /* skip */ } \
+			else if (_w >= outlen - off) off = outlen - 1; \
+			else                         off += _w; \
+		} \
+	} while (0)
+
+	for (unsigned k = 0; k < n; k++) {
+		PTPDevicePropDesc *dpd = &params->canon_props.val[idx[k]];
+
+		APPEND("%04X dt=%-7s %s cur=0x%08x",
+		       dpd->DevicePropCode, icc_dtc_name(dpd->DataType),
+		       dpd->GetSet == PTP_DPGS_GetSet ? "rw" : "ro",
+		       icc_dpv_u32(dpd->DataType, &dpd->CurrentValue));
+
+		if (dpd->FormFlag & PTP_DPFF_Enumeration)
+			APPEND(" enum[%d]", dpd->FORM.Enum.NumberOfValues);
+		else if (dpd->FormFlag & PTP_DPFF_Range)
+			APPEND(" range");
+		APPEND("\n");
+	}
+	#undef APPEND
+
+	return (int)n;
+}
+
+static int
+icc_has_op(PTPParams *p, uint16_t op)
+{
+	for (unsigned i = 0; i < p->deviceinfo.Operations_len; i++)
+		if (p->deviceinfo.Operations[i] == op) return 1;
+	return 0;
+}
+
+static int
+icc_has_eos_prop(PTPParams *p, uint16_t dpc)
+{
+	for (unsigned i = 0; i < p->canon_props.len; i++)
+		if (p->canon_props.val[i].DevicePropCode == dpc) return 1;
+	return 0;
+}
+
+int
+gp_iccamera_capabilities(gp_iccamera *icc, char *out, int outlen)
+{
+	PTPParams     *params = &icc->camera->pl->params;
+	PTPDeviceInfo *di     = &params->deviceinfo;
+	int off = 0;
+	unsigned i;
+
+	if (!out || outlen < 1)
+		return -1;
+	out[0] = '\0';
+
+	int is_canon = (di->VendorExtensionID == PTP_VENDOR_CANON);
+	int is_eos   = is_canon && icc_has_op(params, PTP_OC_CANON_EOS_GetEvent);
+	if (is_eos)
+		ptp_check_eos_events(params);   /* populate the EOS property cache */
+
+	#define APPEND(...) do { \
+		if (off < outlen - 1) { \
+			int _w = snprintf(out + off, (size_t)(outlen - off), __VA_ARGS__); \
+			if (_w < 0)                  { /* skip */ } \
+			else if (_w >= outlen - off) off = outlen - 1; \
+			else                         off += _w; \
+		} \
+	} while (0)
+
+	APPEND("== %s ==\n", di->Model ? di->Model : "(unknown model)");
+	APPEND("manufacturer: %s   firmware: %s\n",
+	       di->Manufacturer ? di->Manufacturer : "?", di->DeviceVersion ? di->DeviceVersion : "?");
+	APPEND("serial: %s\n", di->SerialNumber ? di->SerialNumber : "?");
+	APPEND("vendor ext: 0x%08x   ops: %u   events: %u   std props: %u   EOS props: %u\n",
+	       di->VendorExtensionID, di->Operations_len, di->Events_len, di->DeviceProps_len,
+	       (unsigned)params->canon_props.len);
+
+	APPEND("\nCLASS: %s\n",
+	       is_eos   ? "Canon EOS (full support: config tree, capture, live view, events)" :
+	       is_canon ? "Canon legacy / PowerShot (config tree only; no EOS event model)" :
+	                  "non-Canon / generic PTP");
+
+	APPEND("\nFEATURES:\n");
+	APPEND("  remote capture ......... %s\n",
+	       (icc_has_op(params, PTP_OC_CANON_EOS_RemoteReleaseOn) ||
+	        icc_has_op(params, PTP_OC_CANON_EOS_RemoteRelease)) ? "yes" : "no");
+	APPEND("  live view (EVF) ........ %s\n",
+	       icc_has_op(params, PTP_OC_CANON_EOS_GetViewFinderData) ? "yes" : "no");
+	APPEND("  autofocus (DoAf) ....... %s\n", icc_has_op(params, PTP_OC_CANON_EOS_DoAf) ? "yes" : "no");
+	APPEND("  movie switch ........... %s\n",
+	       icc_has_op(params, PTP_OC_CANON_EOS_MovieSelectSWOn) ? "yes" : "no");
+	APPEND("  image format (RAW/…) ... %s\n",
+	       icc_has_eos_prop(params, PTP_DPC_CANON_EOS_ImageFormat) ? "yes (0xD120)" : "no");
+	if (icc_has_eos_prop(params, PTP_DPC_CANON_EOS_MovieParam5))
+		APPEND("  movie recording size ... yes: 0xD20D (MovieParam5, R50-style 40-byte struct) — decoded\n");
+	else if (icc_has_eos_prop(params, PTP_DPC_CANON_EOS_MovieParam6))
+		APPEND("  movie recording size ... yes: 0xD29E (MovieParam6, R50 V-style 32-byte struct) — decoded\n");
+	else if (is_eos)
+		APPEND("  movie recording size ... carrier UNKNOWN on this body — discover with\n"
+		       "                           gp_iccamera_watch_prop_changes (see canon-movie-recording-size.md)\n");
+
+	APPEND("\nOPERATIONS (%u):\n", di->Operations_len);
+	for (i = 0; i < di->Operations_len; i++)
+		APPEND("  %04x  %s\n", di->Operations[i], ptp_get_opcode_name(params, di->Operations[i]));
+
+	#undef APPEND
+
+	return is_eos ? GP_ICCAMERA_CLASS_CANON_EOS :
+	       is_canon ? GP_ICCAMERA_CLASS_CANON_LEGACY :
+	                  GP_ICCAMERA_CLASS_UNKNOWN;
+}
+
+int
+gp_iccamera_watch_prop_changes(gp_iccamera *icc, int ms, char *out, int outlen)
+{
+	PTPParams *params = &icc->camera->pl->params;
+
+	if (!out || outlen < 1)
+		return -1;
+	out[0] = '\0';
+	if (params->deviceinfo.VendorExtensionID != PTP_VENDOR_CANON)
+		return -1;
+	if (ms < 0)
+		ms = 0;
+
+	enum { MAXCODES = 128, RAWCAP = 1536 };
+	uint16_t codes[MAXCODES];
+	int      counts[MAXCODES];
+	int      ncodes = 0;
+	char     raw[RAWCAP];
+	int      rawoff = 0;
+	raw[0] = '\0';
+
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	for (;;) {
+		PTPCanonEOSEvent ev;
+
+		if (ptp_check_eos_events(params) != PTP_RC_OK)
+			break;
+
+		while (ptp_get_one_eos_event(params, &ev)) {
+			if (ev.type == PTP_EOSEvent_PropertyChanged) {
+				uint16_t code = ev.u.propid;
+				int f = -1;
+				for (int i = 0; i < ncodes; i++)
+					if (codes[i] == code) { f = i; break; }
+				if (f < 0 && ncodes < MAXCODES) {
+					codes[ncodes] = code; counts[ncodes] = 0; f = ncodes; ncodes++;
+				}
+				if (f >= 0) counts[f]++;
+			} else if (ev.type == PTP_EOSEvent_Unknown && ev.u.info[0]) {
+				/* unhandled event carrying a raw hex payload — capture verbatim */
+				if (rawoff < RAWCAP - 1) {
+					int w = snprintf(raw + rawoff, (size_t)(RAWCAP - rawoff),
+					                 "RAW %s\n", ev.u.info);
+					if (w > 0 && w < RAWCAP - rawoff) rawoff += w;
+					else rawoff = RAWCAP - 1;
+				}
+			}
+			ptp_free_eos_event(&ev);
+		}
+
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long elapsed = (now.tv_sec - t0.tv_sec) * 1000L
+		             + (now.tv_nsec - t0.tv_nsec) / 1000000L;
+		if (elapsed >= ms)
+			break;
+		usleep(50 * 1000);   /* 50 ms between polls */
+	}
+
+	/* sort codes ascending for a stable summary */
+	for (int i = 0; i < ncodes; i++)
+		for (int j = i + 1; j < ncodes; j++)
+			if (codes[j] < codes[i]) {
+				uint16_t tc = codes[i]; codes[i] = codes[j]; codes[j] = tc;
+				int tn = counts[i]; counts[i] = counts[j]; counts[j] = tn;
+			}
+
+	int off = 0;
+	#define APPEND(...) do { \
+		if (off < outlen - 1) { \
+			int _w = snprintf(out + off, (size_t)(outlen - off), __VA_ARGS__); \
+			if (_w < 0)                  { /* skip */ } \
+			else if (_w >= outlen - off) off = outlen - 1; \
+			else                         off += _w; \
+		} \
+	} while (0)
+
+	APPEND("watched %d ms: %d distinct prop code(s)\n", ms, ncodes);
+	for (int i = 0; i < ncodes; i++)
+		APPEND("PROP %04x  x%d\n", codes[i], counts[i]);
+	if (rawoff > 0)
+		APPEND("%s", raw);
+	#undef APPEND
+
+	return ncodes;
+}
+
+/* --- Movie recording size (resolution + fps), via the gp_canon_moviesize table --- */
+
+int
+gp_iccamera_get_movie_size(gp_iccamera *icc,
+                           uint32_t *code, int *width, int *height, int *fps_x100,
+                           char *label, int labellen,
+                           uint32_t *choices, int choicecap, int *nchoices)
+{
+	PTPParams  *params = &icc->camera->pl->params;
+	const char *model  = params->deviceinfo.Model;
+
+	if (code)     *code     = 0;
+	if (width)    *width    = 0;
+	if (height)   *height   = 0;
+	if (fps_x100) *fps_x100 = 0;
+	if (label && labellen > 0) label[0] = '\0';
+	if (nchoices) *nchoices = 0;
+
+	uint16_t prop = gp_canon_moviesize_prop(model);
+	if (!prop)
+		return -2;   /* body's movie-size property unknown (e.g. EOS R50 V) or unknown body */
+
+	/* The driver packs each movie-size struct into a u32: (rescode<<16)|(fps*100). `choices`
+	 * (if requested) returns the camera's availlist of valid sizes — decode each with
+	 * gp_canon_moviesize_decode to build a picker. */
+	uint32_t packed = 0, dt = 0;
+	if (gp_iccamera_get_eosprop(icc, prop, &packed, &dt, choices, choicecap, nchoices) != 0)
+		return -1;   /* property not reported by this body */
+
+	if (code) *code = packed;
+
+	gp_canon_movsize m;
+	gp_canon_moviesize_decode(model, packed, &m);
+	if (width)    *width    = m.width;
+	if (height)   *height   = m.height;
+	if (fps_x100) *fps_x100 = m.fps_x100;
+	if (label && labellen > 0) {
+		if (m.width > 0)
+			snprintf(label, (size_t)labellen, "%dx%d %d.%02dp",
+			         m.width, m.height, m.fps_x100/100, m.fps_x100%100);
+		else
+			snprintf(label, (size_t)labellen, "res?(0x%x) %d.%02dp",
+			         packed >> 16, m.fps_x100/100, m.fps_x100%100);
+	}
+	return 0;
+}
+
+int
+gp_iccamera_set_movie_size(gp_iccamera *icc, uint32_t code)
+{
+	PTPParams *params = &icc->camera->pl->params;
+	uint16_t   prop   = gp_canon_moviesize_prop(params->deviceinfo.Model);
+	if (!prop)
+		return -2;
+	/* `code` is the packed (rescode<<16)|(fps*100); ptp_canon_eos_setdevicepropvalue expands it
+	 * back into the 40-byte MovieParam5 struct. */
+	return gp_iccamera_set_eosprop(icc, prop, code);
 }
 
 /* --- Event-driven update: drain the one Canon EOS event queue (EDSDK property/object/state

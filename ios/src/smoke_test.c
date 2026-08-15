@@ -14,6 +14,7 @@
 #include <gphoto2/gphoto2-version.h>
 #include "gp_ios_register.h"
 #include "gp_canon_imagesize.h"
+#include "gp_canon_moviesize.h"
 
 /* Exercise the Canon size-class → pixel-dimension resolver against known-good values
  * (R50 measured on-body at 4:3; 5D Mk III + R5 from the seeded table). Returns the number
@@ -59,6 +60,87 @@ check_imagesize(void)
 	return fails;
 }
 
+/* Movie-size resolver: per-body carrier property + code lookup (labels still pending). */
+static int
+check_moviesize(void)
+{
+	int fails = 0;
+
+	/* Carriers, both on-body verified: R50 = 0xD20D (MovieParam5), R50 V = 0xD29E (MovieParam6). */
+	uint16_t r50  = gp_canon_moviesize_prop("Canon EOS R50");
+	uint16_t r50v = gp_canon_moviesize_prop("Canon EOS R50 V");
+	printf("  %-4s moviesize prop  R50=0x%04X  R50V=0x%04X\n",
+	       (r50 == 0xD20D && r50v == 0xD29E) ? "ok" : "FAIL", r50, r50v);
+	if (!(r50 == 0xD20D && r50v == 0xD29E)) fails++;
+
+	/* Both bodies share resolution codes; R50 V decodes the same packed value (fractional fps). */
+	{
+		gp_canon_movsize m;
+		int known = gp_canon_moviesize_decode("Canon EOS R50 V", (5u<<16)|2398, &m);  /* 4K 23.98p */
+		int ok = known && m.width==3840 && m.height==2160 && m.fps_x100==2398;
+		printf("    %-4s R50 V decode 4K 23.98p -> %dx%d %d.%02dp\n", ok?"ok":"FAIL",
+		       m.width, m.height, m.fps_x100/100, m.fps_x100%100);
+		if (!ok) fails++;
+	}
+
+	/* Decode the packed (rescode<<16)|(fps*100) — the exact values captured on the R50. */
+	struct { uint32_t packed; int w, h, fps; int known; } dec[] = {
+		{ (0u<<16)|2500,  1920, 1080, 2500,  1 },  /* FHD 25.00p   */
+		{ (0u<<16)|5000,  1920, 1080, 5000,  1 },  /* FHD 50.00p   */
+		{ (0u<<16)|10000, 1920, 1080, 10000, 1 },  /* FHD 100.00p  */
+		{ (5u<<16)|2500,  3840, 2160, 2500,  1 },  /* 4K UHD 25.00p*/
+		{ (7u<<16)|3000,  0,    0,    3000,  0 },  /* unknown res code → dims 0, fps kept */
+	};
+	for (unsigned i = 0; i < sizeof(dec)/sizeof(dec[0]); i++) {
+		gp_canon_movsize m;
+		int known = gp_canon_moviesize_decode("Canon EOS R50", dec[i].packed, &m);
+		int ok = known == dec[i].known && m.width == dec[i].w &&
+		         m.height == dec[i].h && m.fps_x100 == dec[i].fps;
+		printf("    %-4s decode 0x%08x -> %dx%d %d.%02dp\n", ok ? "ok" : "FAIL",
+		       dec[i].packed, m.width, m.height, m.fps_x100/100, m.fps_x100%100);
+		if (!ok) fails++;
+	}
+
+	/* Encode round-trips: dims+fps+compression → packed. */
+	uint32_t p = 0;
+	if (!gp_canon_moviesize_encode("Canon EOS R50", 3840, 2160, 2500, GP_CANON_IPB_STANDARD, &p) ||
+	    p != ((5u<<16)|2500))
+		{ printf("  FAIL encode 4K25p (got 0x%08x)\n", p); fails++; }
+	if (!gp_canon_moviesize_encode("Canon EOS R50", 1920, 1080, 5000, GP_CANON_IPB_STANDARD, &p) ||
+	    p != ((0u<<16)|5000))
+		{ printf("  FAIL encode FHD50p (got 0x%08x)\n", p); fails++; }
+
+	/* IPB Light lands in bits 24..31 and survives a round-trip. Confirmed on an R50:
+	 * MovieParam5 word 5 is 0 for IPB Standard and 1 for IPB Light. */
+	if (!gp_canon_moviesize_encode("Canon EOS R50", 3840, 2160, 2398, GP_CANON_IPB_LIGHT, &p) ||
+	    p != ((1u<<24)|(5u<<16)|2398))
+		{ printf("  FAIL encode 4K23.98p IPB Light (got 0x%08x)\n", p); fails++; }
+	{
+		gp_canon_movsize m;
+		int known = gp_canon_moviesize_decode("Canon EOS R50", (1u<<24)|(5u<<16)|2398, &m);
+		int ok = known && m.width==3840 && m.height==2160 && m.fps_x100==2398 &&
+		         m.compression==GP_CANON_IPB_LIGHT;
+		printf("    %-4s decode IPB Light -> %dx%d %d.%02dp comp=%d\n", ok?"ok":"FAIL",
+		       m.width, m.height, m.fps_x100/100, m.fps_x100%100, m.compression);
+		if (!ok) fails++;
+	}
+	/* A packed value with no compression bits still decodes as IPB Standard (back-compat). */
+	{
+		gp_canon_movsize m;
+		gp_canon_moviesize_decode("Canon EOS R50", (5u<<16)|2500, &m);
+		if (m.compression != GP_CANON_IPB_STANDARD)
+			{ printf("  FAIL legacy packed should decode as IPB Standard\n"); fails++; }
+	}
+
+	/* both bodies known; a non-Canon isn't */
+	if (!gp_canon_moviesize_known_body("Canon EOS R50"))   { printf("  FAIL movie known_body(R50)\n");  fails++; }
+	if (!gp_canon_moviesize_known_body("Canon EOS R50 V")) { printf("  FAIL movie known_body(R50 V)\n"); fails++; }
+	if ( gp_canon_moviesize_known_body("Nikon Z6"))        { printf("  FAIL movie known_body(Nikon Z6)\n"); fails++; }
+
+	printf("  %-4s moviesize resolver checks\n", fails ? "FAIL" : "ok");
+	return fails;
+}
+
 int
 main(void)
 {
@@ -101,6 +183,10 @@ main(void)
 	printf("image-size resolver:\n");
 	int isf = check_imagesize();
 	if (isf) { printf("FAIL: %d image-size case(s) wrong\n", isf); return 1; }
+
+	printf("movie-size resolver:\n");
+	int msf = check_moviesize();
+	if (msf) { printf("FAIL: %d movie-size case(s) wrong\n", msf); return 1; }
 
 	printf("SMOKE TEST OK\n");
 	return 0;

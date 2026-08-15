@@ -2053,6 +2053,36 @@ ptp_unpack_EOS_events (PTPParams *params, const unsigned char* data, unsigned in
 			dpd->FORM.Enum.SupportedValue = calloc (dpd_count, sizeof (PTPPropValue));
 
 			switch (dpc) {
+			case PTP_DPC_CANON_EOS_MovieParam5:
+			case PTP_DPC_CANON_EOS_MovieParam6: {
+				/* Availlist of valid movie recording sizes: dpd_count structs, each with the
+				 * resolution code at +0x08, the (actual) fps*100 at +4 (MovieParam5) or +28
+				 * (MovieParam6), and the compression variant at +0x14 (word 5, MovieParam5 only).
+				 * Pack each to (compression<<24)|(rescode<<16)|(fps*100) — same as the value
+				 * decode — so FORM.Enum.SupportedValue holds the selectable list.
+				 *
+				 * The compression word matters: the R50 lists each resolution+fps TWICE, once per
+				 * IPB variant. Without it the availlist collapses into duplicate entries and a
+				 * picker built from it cannot offer IPB Standard vs IPB Light. */
+				unsigned stride  = dpd_count ? xsize / dpd_count : 0;
+				unsigned fps_off = (dpc == PTP_DPC_CANON_EOS_MovieParam6) ? 28 : 4;
+				dpd->DataType = PTP_DTC_UINT32;
+				if (stride < 12 || (uint32_t)stride * dpd_count > xsize) {
+					ptp_debug (params, "%s movie availlist bad stride %u count %u xsize %u", prefix, stride, dpd_count, xsize);
+					dpd->FORM.Enum.NumberOfValues = 0;
+					break;
+				}
+				for (j = 0; j < dpd_count; j++) {
+					const uint8_t *ent = xdata + j*stride;
+					uint32_t mres = dtoh32a(ent + 8), mfps = dtoh32a(ent + fps_off);
+					uint32_t mcomp = (stride >= 24) ? dtoh32a(ent + 20) : 0;
+					dpd->FORM.Enum.SupportedValue[j].u32 =
+						((mcomp & 0xff) << 24) | ((mres & 0xff) << 16) | (mfps & 0xffff);
+					ptp_debug (params, INDENT "prop %x movie size opt[%d] = res %u, %u.%02u fps, compression %u -> 0x%08x",
+					           dpc, j, mres, mfps/100, mfps%100, mcomp, dpd->FORM.Enum.SupportedValue[j].u32);
+				}
+				break;
+			}
 			case PTP_DPC_CANON_EOS_ImageFormat:
 			case PTP_DPC_CANON_EOS_ImageFormatCF:
 			case PTP_DPC_CANON_EOS_ImageFormatSD:
@@ -2282,6 +2312,15 @@ ptp_unpack_EOS_events (PTPParams *params, const unsigned char* data, unsigned in
 			case PTP_DPC_CANON_EOS_PhotoStudioMode:
 			case PTP_DPC_CANON_EOS_EVFClickWBCoeffs:
 			case PTP_DPC_CANON_EOS_MovSize:
+			/* movie recording-size family (discovered via prop-change watch on the R50:
+			 * MovieParam5/0xD20D fires on movie rec-size changes). Decode as UINT32 so the
+			 * value is readable; see docs-architecture/canon-movie-size-probe-updated.md. */
+			case PTP_DPC_CANON_EOS_MovieParam5:
+			case PTP_DPC_CANON_EOS_MovieSelfTimer:
+			case PTP_DPC_CANON_EOS_HDRViewAssistModeRec:
+			case PTP_DPC_CANON_EOS_VariableMovieRecSetting:
+			case PTP_DPC_CANON_EOS_MovieSpatialOversampling:
+			case PTP_DPC_CANON_EOS_MovieCropMode:
 			case PTP_DPC_CANON_EOS_DepthOfField:
 			case PTP_DPC_CANON_EOS_Brightness:
 			case PTP_DPC_CANON_EOS_GPSLogCtrl:
@@ -2304,6 +2343,13 @@ ptp_unpack_EOS_events (PTPParams *params, const unsigned char* data, unsigned in
 				dpd->DataType = PTP_DTC_UNDEF;
 				break;
 			default:
+				/* Discovery aid (iOS bridge): decode otherwise-unknown EOS props as UINT32
+				 * (word 0) so their values are visible for before/after diffing — otherwise
+				 * they stay UNDEF and always read 0x0, hiding real changes (e.g. movie
+				 * recording size). Guard on a >=4-byte payload; multi-word/struct props show
+				 * only word 0, which is still enough to spot that something changed. */
+				if (xsize >= sizeof(uint32_t))
+					dpd->DataType = PTP_DTC_UINT32;
 				ptp_debug_data (params, xdata, xsize);
 				break;
 			}
@@ -2383,6 +2429,43 @@ ptp_unpack_EOS_events (PTPParams *params, const unsigned char* data, unsigned in
 				dpd->DefaultValue.str = ptp_unpack_EOS_FocusInfoEx( params, &xdata, xsize );
 				dpd->CurrentValue.str = strdup( (char*)dpd->DefaultValue.str );
 				ptp_debug (params, INDENT "prop %x value == %s", dpc, dpd->CurrentValue.str);
+				break;
+			case PTP_DPC_CANON_EOS_MovieParam5:
+				/* Movie recording size: a 40-byte struct
+				 *   { size=40, fps*100, rescode, 3, 1, compression, 0, gamma, bitdepth, 0 }
+				 * (verified on the EOS R50: 4K/25p = {40,2500,5,..}, FHD/100p = {40,10000,0,..}).
+				 * Pack the three settable words into the u32 the config/bridge layer reads:
+				 *   (compression << 24) | (rescode << 16) | (fps*100 & 0xffff)
+				 * word 5 = compression, 0 = IPB Standard, 1 = IPB Light — confirmed by toggling it
+				 * on an R50. Words 7/8 = gamma + bit depth ({2,10} vs {1,8}) track HDR PQ (0xD20C),
+				 * not the recording size, so they are deliberately NOT packed here: read 0xD20C.
+				 * See ios/src/gp_canon_moviesize.c and docs-architecture/canon-movie-recording-size.md. */
+				dpd->DataType = PTP_DTC_UINT32;
+				if (xsize >= 24) {
+					uint32_t mfps = dtoh32a(xdata + 4), mres = dtoh32a(xdata + 8);
+					uint32_t mcomp = dtoh32a(xdata + 20);
+					dpd->DefaultValue.u32 = dpd->CurrentValue.u32 =
+						((mcomp & 0xff) << 24) | ((mres & 0xff) << 16) | (mfps & 0xffff);
+					ptp_debug (params, INDENT "prop %x movie size: %u.%02u fps, res %u, compression %u -> 0x%08x",
+					           dpc, mfps/100, mfps%100, mres, mcomp, dpd->CurrentValue.u32);
+				} else if (xsize >= 12) {
+					uint32_t mfps = dtoh32a(xdata + 4), mres = dtoh32a(xdata + 8);
+					dpd->DefaultValue.u32 = dpd->CurrentValue.u32 = ((mres & 0xff) << 16) | (mfps & 0xffff);
+					ptp_debug (params, INDENT "prop %x movie size: %u.%02u fps, res %u -> 0x%08x",
+					           dpc, mfps/100, mfps%100, mres, dpd->CurrentValue.u32);
+				}
+				break;
+			case PTP_DPC_CANON_EOS_MovieParam6:
+				/* R50 V movie recording size: 32-byte struct { size=32, nomfps*100, rescode,
+				 * 3,1,0,0, actfps*100 }. rescode at word 2 (0x08), ACTUAL fps at word 7 (0x1c).
+				 * Pack the same way as MovieParam5: (rescode<<16)|(actfps*100 & 0xffff). */
+				dpd->DataType = PTP_DTC_UINT32;
+				if (xsize >= 32) {
+					uint32_t mres = dtoh32a(xdata + 8), mfps = dtoh32a(xdata + 28);
+					dpd->DefaultValue.u32 = dpd->CurrentValue.u32 = (mres << 16) | (mfps & 0xffff);
+					ptp_debug (params, INDENT "prop %x movie size: %u.%02u fps, res %u -> 0x%08x",
+					           dpc, mfps/100, mfps%100, mres, dpd->CurrentValue.u32);
+				}
 				break;
 			/* case PTP_DPC_CANON_EOS_ShutterReleaseCounter:
 				* There are 16 bytes sent by an R8, which look like 4 int numbers: 16, 1, 1000, 1000

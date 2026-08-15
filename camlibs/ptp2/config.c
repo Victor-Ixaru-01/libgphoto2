@@ -8119,19 +8119,35 @@ static struct deviceproptableu16 olympus_whitebalanceadjust[] = {
 };
 GENERIC16TABLE(Olympus_WhiteBalanceAdjust, olympus_whitebalanceadjust)
 
+/* Canon EOS_BatteryPower (0xD111) is a coarse level indicator, not a percentage.
+ * Returns the percentage the level stands for, 0 for "Low" (which has no percentage),
+ * or -1 for a value we do not know.
+ */
+static int
+_canon_eos_batterypower_percent (uint16_t value) {
+	switch (value) {
+	case 0:	 return 0;	/* "Low" */
+	case 1:	 return 50;
+	case 2:	 return 100;
+	case 4:	 return 75;
+	case 5:	 return 25;
+	default: return -1;
+	}
+}
+
 static int
 _get_BatteryLevel(CONFIG_GET_ARGS) {
-	unsigned char value_float , start, end;
-	char	buffer[20];
+	PTPParams	*params = &camera->pl->params;
+	int		percent, eos_low = 0;
+	char		buffer[20];
 
 	if (dpd->DataType != PTP_DTC_UINT8)
 		return GP_ERROR;
 	gp_widget_new (GP_WIDGET_TEXT, _(menu->label), widget);
+	gp_widget_set_name (*widget, menu->name);
 
 	if (dpd->FormFlag == PTP_DPFF_Enumeration) {
 		unsigned int i, highest = 0, factor = 1;
-
-		gp_widget_set_name (*widget, menu->name);
 
 		/* This is for Canon ... they have enums  [0,1,2,3] and [0,25,50,75,100] .. For the 0-3 enum, multiply by 33 */
 		for (i=0;i<dpd->FORM.Enum.NumberOfValues;i++) {
@@ -8140,24 +8156,46 @@ _get_BatteryLevel(CONFIG_GET_ARGS) {
 		}
 		if (highest == 3) factor = 33;
 
-		sprintf (buffer, "%d%%", dpd->CurrentValue.u8 * factor);
-		return gp_widget_set_value(*widget, buffer);
+		percent = dpd->CurrentValue.u8 * factor;
+	} else if (dpd->FormFlag == PTP_DPFF_Range) {
+		unsigned char start = dpd->FORM.Range.MinValue.u8;
+		unsigned char end   = dpd->FORM.Range.MaxValue.u8;
+
+		if (0 == end - start + 1)	/* avoid division by 0 */
+			return gp_widget_set_value(*widget, "broken");
+		percent = (int)((dpd->CurrentValue.u8-start+1)*100/(end-start+1));
+	} else {
+		/* Enumeration is also valid on EOS, but this will be just be the % value */
+		percent = dpd->CurrentValue.u8;
 	}
-	if (dpd->FormFlag == PTP_DPFF_Range) {
-		gp_widget_set_name (*widget, menu->name);
-		start = dpd->FORM.Range.MinValue.u8;
-		end = dpd->FORM.Range.MaxValue.u8;
-		value_float = dpd->CurrentValue.u8;
-		if (0 == end - start + 1) {
-			/* avoid division by 0 */
-			sprintf (buffer, "broken");
-		} else {
-			sprintf (buffer, "%d%%", (int)((value_float-start+1)*100/(end-start+1)));
+
+	/* Neither battery property can be trusted on its own on Canon EOS bodies. The EOS R50 V
+	 * pins the standard BatteryLevel (0x5001) at 100 whatever the actual charge is, while its
+	 * EOS_BatteryPower (0xD111) correctly reports half. Other bodies are the other way round:
+	 * the EOS R6 and R6 Mark III report a fine grained percentage in 0x5001 (28% and 24% in
+	 * our captures) that 0xD111 only buckets into "50%". So report the lower of the two -
+	 * reading low is a nuisance, reading 100% on a half empty battery is the bug.
+	 */
+	if (have_eos_prop (params, PTP_VENDOR_CANON, PTP_DPC_CANON_EOS_BatteryPower)) {
+		PTPDevicePropDesc	eosdpd;
+
+		memset (&eosdpd, 0, sizeof(eosdpd));
+		if (PTP_RC_OK == ptp_canon_eos_getdevicepropdesc (params, PTP_DPC_CANON_EOS_BatteryPower, &eosdpd)) {
+			int eospercent = _canon_eos_batterypower_percent (eosdpd.CurrentValue.u16);
+
+			if (eospercent == 0) {
+				eos_low = 1;	/* below the lowest bucket we can put a number on */
+			} else if ((eospercent > 0) && (eospercent < percent)) {
+				GP_LOG_D ("EOS_BatteryPower says %d%%, BatteryLevel says %d%%, using the lower one",
+					  eospercent, percent);
+				percent = eospercent;
+			}
+			ptp_free_devicepropdesc (&eosdpd);
 		}
-		return gp_widget_set_value(*widget, buffer);
 	}
-	/* Enumeration is also valid on EOS, but this will be just be the % value */
-	sprintf (buffer, "%d%%", dpd->CurrentValue.u8);
+	if (eos_low)
+		return gp_widget_set_value(*widget, _("Low"));
+	sprintf (buffer, "%d%%", percent);
 	return gp_widget_set_value(*widget, buffer);
 }
 
@@ -8197,17 +8235,21 @@ _get_SONY_BatteryLevel(CONFIG_GET_ARGS) {
 
 static int
 _get_Canon_EOS_BatteryLevel(CONFIG_GET_ARGS) {
+	int	percent;
+	char	buffer[20];
+
 	if (dpd->DataType != PTP_DTC_UINT16)
 		return (GP_ERROR);
 	gp_widget_new (GP_WIDGET_TEXT, _(menu->label), widget);
 	gp_widget_set_name (*widget, menu->name);
-	switch (dpd->CurrentValue.u16) {
-	case 0: gp_widget_set_value(*widget, _("Low")); break;
-	case 1: gp_widget_set_value(*widget, _("50%")); break;
-	case 2: gp_widget_set_value(*widget, _("100%")); break;
-	case 4: gp_widget_set_value(*widget, _("75%")); break;
-	case 5: gp_widget_set_value(*widget, _("25%")); break;
-	default: gp_widget_set_value(*widget, _("Unknown value")); break;
+	percent = _canon_eos_batterypower_percent (dpd->CurrentValue.u16);
+	if (percent < 0)
+		gp_widget_set_value(*widget, _("Unknown value"));
+	else if (percent == 0)
+		gp_widget_set_value(*widget, _("Low"));
+	else {
+		sprintf (buffer, "%d%%", percent);
+		gp_widget_set_value(*widget, buffer);
 	}
 	return (GP_OK);
 }
@@ -12702,9 +12744,19 @@ _get_config (Camera *camera, const char *confname, CameraWidget **outwidget, Cam
 
 				if ((mode == MODE_SINGLE_GET) && strcmp (cursub->name, confname))
 					continue;
+				/* Another table entry might provide this name already, the standard branch
+				 * above guards against that the same way. 'batterylevel' for instance is
+				 * provided both by the standard 0x5001 property and by EOS_BatteryPower,
+				 * and Canon EOS bodies have both. */
 				if (mode == MODE_LIST) {
-					gp_list_append (list, cursub->name, NULL);
+					if (GP_OK != gp_list_find_by_name (list, NULL, cursub->name))
+						gp_list_append (list, cursub->name, NULL);
 					continue;
+				}
+				if (mode == MODE_GET) {
+					CameraWidget *child = NULL;
+					if ((GP_OK == gp_widget_get_child_by_name (section, cursub->name, &child)) && child)
+						continue;
 				}
 				GP_LOG_D ("Getting property '%s' / 0x%04x", cursub->label, cursub->propid );
 				memset(&dpd,0,sizeof(dpd));

@@ -3948,6 +3948,52 @@ ptp_canon_eos_setdevicepropvalue (PTPParams* params,
 		if (!data) return PTP_RC_GeneralError;
 		ptp_pack_EOS_CustomFuncEx( params, data + 8, value->str );
 		break;
+	case PTP_DPC_CANON_EOS_MovieParam5: {
+		/* Movie recording size: rebuild the 40-byte struct from the packed value the config
+		 * layer uses, (compression<<24)|(rescode<<16)|(fps*100).
+		 *
+		 * Words 3,4 = {3,1} are genuinely constant across every recording size on the R50.
+		 * Word 5 is the compression variant (0 IPB Standard, 1 IPB Light) and MUST come from
+		 * the packed value — hardcoding 0 here silently switched the body back to Standard on
+		 * every resolution change.
+		 * Words 7,8 = gamma + bit depth. They track HDR PQ (0xD20C): {2,10} with it on, {1,8}
+		 * with it off. Derive them from the cached HDR PQ value rather than hardcoding {2,10},
+		 * which forced PQ/10-bit onto a body that had HDR PQ switched off.
+		 * See ptp-pack.c MovieParam5 unpack + docs-architecture/canon-movie-remaining-time.md. */
+		uint32_t packed = value->u32;
+		uint32_t comp   = (packed >> 24) & 0xff;
+		uint32_t res    = (packed >> 16) & 0xff;
+		uint32_t gamma = 1, depth = 8;
+		PTPDevicePropDesc *hdr = ptp_find_eos_devicepropdesc (params, PTP_DPC_CANON_EOS_2GHDRSetting);
+		unsigned wi;
+
+		if (hdr && hdr->CurrentValue.u32) { gamma = 2; depth = 10; }
+		uint32_t words[10] = { 40, packed & 0xffff, res, 3, 1, comp, 0, gamma, depth, 0 };
+		size = 8 + 40;
+		data = malloc( size );
+		if (!data) return PTP_RC_GeneralError;
+		for (wi = 0; wi < 10; wi++)
+			htod32a( data + 8 + wi*4, words[wi] );
+		break;
+	}
+	case PTP_DPC_CANON_EOS_MovieParam6: {
+		/* R50 V movie recording size: rebuild the 32-byte struct from packed
+		 * (rescode<<16)|(actfps*100). {size=32, nomfps, rescode, 3,1,0,0, actfps};
+		 * nomfps = actfps rounded to nearest 100. See ptp-pack.c MovieParam6 unpack. */
+		uint32_t packed = value->u32, act = packed & 0xffff, res = (packed >> 16) & 0xff;
+		uint32_t nom = ((act + 50) / 100) * 100;
+		/* The R50 V has no IPB Standard/Light axis — its variants live in the recording format
+		 * (0xD257). Word 5 has only ever been observed as 0 here, but carry the packed value
+		 * through anyway so a round-trip cannot silently change it. */
+		uint32_t words[8] = { 32, nom, res, 3, 1, (packed >> 24) & 0xff, 0, act };
+		unsigned wi;
+		size = 8 + 32;
+		data = malloc( size );
+		if (!data) return PTP_RC_GeneralError;
+		for (wi = 0; wi < 8; wi++)
+			htod32a( data + 8 + wi*4, words[wi] );
+		break;
+	}
 	default:
 		if (datatype != PTP_DTC_STR)
 			size = sizeof(uint32_t)*3;
@@ -6493,6 +6539,8 @@ ptp_get_property_description(PTPParams* params, uint32_t dpc)
 		{PTP_DPC_CANON_EOS_Clarity,"EOS_Clarity"},
 		{PTP_DPC_CANON_EOS_2GHDRSetting,"EOS_2GHDRSetting"},
 		{PTP_DPC_CANON_EOS_MovieParam5,"EOS_MovieParam5"},
+		{PTP_DPC_CANON_EOS_MovieParam6,"EOS_MovieParam6"},
+		{PTP_DPC_CANON_EOS_MovieRecordingFormat,"EOS_MovieRecordingFormat"},
 		{PTP_DPC_CANON_EOS_HDRViewAssistModeRec,"EOS_HDRViewAssistModeRec"},
 		{PTP_DPC_CANON_EOS_PropFinderAFFrame,"EOS_PropFinderAFFrame"},
 		{PTP_DPC_CANON_EOS_VariableMovieRecSetting,"EOS_VariableMovieRecSetting"},

@@ -124,6 +124,27 @@ int gp_iccamera_get_evf_frame(gp_iccamera *, int *x, int *y, int *w, int *h);
  * >18000 = negative). Returns 0 with values set, or -1. */
 int gp_iccamera_get_level(gp_iccamera *, uint32_t *a, uint32_t *b);
 
+/* Camera orientation, derived from the roll of the EVF electronic level (record type 16). */
+typedef enum {
+	GP_ICCAMERA_ORIENTATION_UNKNOWN            = -1, /* level not reported yet          */
+	GP_ICCAMERA_ORIENTATION_LANDSCAPE          =   0,/* top up,    roll ~   0°          */
+	GP_ICCAMERA_ORIENTATION_PORTRAIT_CW        =  90,/* rotated clockwise,  roll ~ +90° */
+	GP_ICCAMERA_ORIENTATION_LANDSCAPE_INVERTED = 180,/* top down,  roll ~ ±180°         */
+	GP_ICCAMERA_ORIENTATION_PORTRAIT_CCW       = 270 /* rotated counter-cw, roll ~ -90° */
+} gp_iccamera_orientation;
+
+/* Classify the body as portrait/landscape from the last live-view frame's roll (record type 16),
+ * returning one of the gp_iccamera_orientation values above. Returns
+ * GP_ICCAMERA_ORIENTATION_UNKNOWN (-1) when the level isn't being reported yet — enable it with
+ * gp_iccamera_rollpitch(,1) AND keep live view running (the value rides in the EVF buffer).
+ * Optionally writes the signed level in whole degrees to *roll_deg / *pitch_deg: roll = tilt about
+ * the lens axis (the portrait/landscape signal), pitch = nose up/down. Caveat: when the camera is
+ * aimed near straight up or down (|pitch| → 90°) roll degenerates and the class is unreliable —
+ * gate on *pitch_deg there and hold the last good value. The CW/CCW → 90°/270° mapping follows the
+ * R50; verify the sign on your body with gp_iccamera_liveview_inspect and swap the two PORTRAIT_*
+ * cases in gp_iccamera_get_orientation() if reversed. */
+int gp_iccamera_get_orientation(gp_iccamera *, int *roll_deg, int *pitch_deg);
+
 /* Touch-AF: set the live-view AF frame to (x,y) in the EVF coordinate space (opcode 0x915A).
  * EXPERIMENTAL payload (x,y as 2x u32) — writes "SetLiveAfFrame(x,y) → 0x….." to `status`. */
 int gp_iccamera_set_af_frame(gp_iccamera *, int x, int y, char *status, int statuslen);
@@ -154,6 +175,96 @@ int gp_iccamera_drive_powerzoom(gp_iccamera *, int mode);       /* DrivePowerZoo
 int gp_iccamera_get_eosprop(gp_iccamera *, uint16_t code, uint32_t *value, uint32_t *datatype,
                             uint32_t *choices, int choicecap, int *nchoices);
 int gp_iccamera_set_eosprop(gp_iccamera *, uint16_t code, uint32_t value);
+
+/* Photo vs. video (movie) mode — reflects the body's physical photo/movie switch, or the
+ * "Movie" position on the mode dial. Reads FixedMovie (0xD1C2, the movie switch) as the
+ * primary signal, and AutoExposureMode (0xD105, whose value 0x14 == "Movie") as a fallback/
+ * cross-check. Optionally writes the raw underlying values to *raw_fixedmovie / *raw_aemode
+ * (each -1 when that property wasn't readable) so you can confirm the mapping on your body.
+ * Returns one of the gp_iccamera_movie_mode values below. Background thread.
+ *
+ * NOTE: which DPC actually moves when you flip the switch varies per body (on R-series it's
+ * usually 0xD1C2; on DSLRs with a Movie dial position it's the AE mode). If this returns
+ * UNKNOWN or the wrong state on yours, flip the switch while draining gp_iccamera_poll_events,
+ * note which "PROP <hex>" fires, and read that code with gp_iccamera_get_eosprop to pin the
+ * mapping — see docs-architecture/canon-photo-video-mode.md. */
+typedef enum {
+	GP_ICCAMERA_MOVIE_MODE_UNKNOWN = -1, /* neither property readable */
+	GP_ICCAMERA_MOVIE_MODE_PHOTO   =  0, /* stills             */
+	GP_ICCAMERA_MOVIE_MODE_VIDEO   =  1  /* movie / video      */
+} gp_iccamera_movie_mode;
+
+int gp_iccamera_get_movie_mode(gp_iccamera *, int *raw_fixedmovie, int *raw_aemode);
+
+/* Movie-size DISCOVERY probe: dumps the candidate Canon EOS movie properties — MovSize
+ * (0xD1BB), MovieParam/2..5, VariableMovieRecSetting (0xD215) — each as a line carrying its
+ * datatype, read/write flag, current raw code, and the enumeration of valid codes (or range).
+ * Use it to reverse-engineer the resolution/framerate encoding on a specific body: call it,
+ * change the movie recording size / frame rate on the camera, call it again, and diff which
+ * property + code moved. That also answers whether one scalar code carries both resolution and
+ * fps (a single prop moves) or they live in separate props. Writes newline-separated lines to
+ * `out`; returns 0 on success, negative on usage error. Background thread.
+ * See docs-architecture/canon-movie-size-probe.md. */
+int gp_iccamera_movie_size_probe(gp_iccamera *, char *out, int outlen);
+
+/* Full EOS device-property dump: one compact line per property in the driver's Canon EOS
+ * cache — code, datatype, rw/ro, current raw value, and form (enum[N]/range/-), sorted by
+ * code. The decisive discovery tool when a setting isn't under a code you guessed: dump,
+ * change the setting on the camera, dump again, diff which code's `cur` moved. Pass a generous
+ * buffer (>= 16 KB). Returns the number of properties written, or negative on usage error.
+ * Background thread; run it in the relevant mode (e.g. movie mode — gp_iccamera_get_movie_mode()
+ * == VIDEO) since some properties only populate there. */
+int gp_iccamera_eos_props_dump(gp_iccamera *, char *out, int outlen);
+
+/* What class of camera is connected (returned by gp_iccamera_capabilities). */
+typedef enum {
+	GP_ICCAMERA_CLASS_UNKNOWN      = 0, /* non-Canon or generic PTP                                */
+	GP_ICCAMERA_CLASS_CANON_LEGACY = 1, /* PowerShot / non-EOS Canon (config tree works, no EOS events) */
+	GP_ICCAMERA_CLASS_CANON_EOS    = 2  /* full EOS support: config tree, capture, live view, events    */
+} gp_iccamera_class;
+
+/* Self-describing capability report for ANY connected camera — this is the "what can this camera
+ * do" probe, and it needs NO per-body knowledge. Writes to `out`: identity (model/firmware/serial/
+ * vendor), class, feature detection (remote capture, live view, AF, movie switch, image format,
+ * and which movie-size carrier — 0xD20D / 0xD29E / unknown), and the full list of supported
+ * operations (commands, named). Returns the gp_iccamera_class (>=0), or negative on error. Pass a
+ * generous buffer (>= 16 KB). For the full property list use gp_iccamera_eos_props_dump(), and to
+ * drive any setting use gp_iccamera_list_config/get_config/set_config. Background thread. */
+int gp_iccamera_capabilities(gp_iccamera *, char *out, int outlen);
+
+/* Watch the Canon EOS event queue for `ms` milliseconds and report which device properties
+ * changed — by CODE, so it catches even UNDEF (undecoded) properties that gp_iccamera_eos_props_dump
+ * can't show. Change a setting on the camera during the window; whatever fires is the property
+ * behind it. Writes a summary to `out`:
+ *     watched <ms> ms: <k> distinct prop code(s)
+ *     PROP d1c2  x3            (each changed code + how many times it fired, sorted)
+ *     RAW <code> <hex…>        (any unhandled event carrying a raw payload, verbatim)
+ * Returns the number of DISTINCT property codes seen (0 = nothing changed), or negative on error.
+ * Blocks for ~`ms`; call on the BACKGROUND thread. */
+int gp_iccamera_watch_prop_changes(gp_iccamera *, int ms, char *out, int outlen);
+
+/* Movie recording size (resolution + fps). Reads the body's movie-size device property (per the
+ * gp_canon_moviesize table — 0xD20D on the EOS R50) and resolves it to dimensions/fps/label.
+ *   *code                  the raw property value (always set on success)
+ *   *width/*height/*fps_x100  0 when the code isn't mapped to a resolution yet (fps ×100)
+ *   label                  camera-style label buffer, "" if unmapped (pass NULL/0 to skip)
+ *   choices/nchoices       the camera's list of VALID movie sizes (packed values; pass NULL/0 to
+ *                          skip). Decode each with gp_canon_moviesize_decode() to build a picker.
+ * Returns 0 on success; -1 if the property isn't reported by this body; -2 if the body's
+ * movie-size property is unknown (needs discovery, e.g. EOS R50 V); -3 on usage/other error.
+ * Background thread. */
+int gp_iccamera_get_movie_size(gp_iccamera *,
+                               uint32_t *code, int *width, int *height, int *fps_x100,
+                               char *label, int labellen,
+                               uint32_t *choices, int choicecap, int *nchoices);
+
+/* Select the movie recording size by `code` (the packed value from get_movie_size, or built with
+ * gp_canon_moviesize_encode). Returns 0 on success; -2 if the body's movie-size property is unknown;
+ * negative on error. A successful change also fires a PROP event, so a poll_events watcher sees it.
+ * NOTE: some camera states silently reject the change — e.g. the R50 in HFR mode (FHD 100p) locks
+ * the recording size and returns OK without changing. ALWAYS read back with get_movie_size to
+ * confirm. Background thread. */
+int gp_iccamera_set_movie_size(gp_iccamera *, uint32_t code);
 
 /* Drain the Canon EOS event queue once — the EDSDK property/object/state events all arrive
  * on this single queue. Writes a newline-separated summary of what was seen to `out`:

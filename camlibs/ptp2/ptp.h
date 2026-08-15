@@ -2309,6 +2309,7 @@ typedef struct _PTPCanonEOSDeviceInfo {
 #define PTP_DPC_CANON_EOS_Clarity		0xD20B
 #define PTP_DPC_CANON_EOS_2GHDRSetting		0xD20C
 #define PTP_DPC_CANON_EOS_MovieParam5		0xD20D
+#define PTP_DPC_CANON_EOS_MovieParam6		0xD29E	/* R50 V movie recording size (32-byte struct: size,nomfps,rescode,3,1,0,0,actfps) */
 #define PTP_DPC_CANON_EOS_HDRViewAssistModeRec	0xD20E
 #define PTP_DPC_CANON_EOS_PropFinderAFFrame	0xD214
 #define PTP_DPC_CANON_EOS_VariableMovieRecSetting	0xD215
@@ -2319,6 +2320,11 @@ typedef struct _PTPCanonEOSDeviceInfo {
 #define PTP_DPC_CANON_EOS_ShutterType		0xD21A
 #define PTP_DPC_CANON_EOS_WFTBatteryPower	0xD21B
 #define PTP_DPC_CANON_EOS_BatteryInfoEx		0xD21C
+/* R50 V movie recording format. 4-value enum, codes are NOT in menu order:
+ * 1 = XF-HEVC S YCC422 10bit, 2 = XF-HEVC S YCC420 10bit,
+ * 3 = XF-AVC S YCC420 8bit,   4 = XF-AVC S YCC422 10bit.
+ * All four confirmed on an EOS R50 V; see docs-architecture/canon-movie-remaining-time.md */
+#define PTP_DPC_CANON_EOS_MovieRecordingFormat	0xD257
 
 /* Nikon extension device property codes */
 #define PTP_DPC_NIKON_ShootingBank			0xD010
