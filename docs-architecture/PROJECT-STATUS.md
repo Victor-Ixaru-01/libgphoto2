@@ -134,5 +134,7 @@ includes `<gphoto2/gphoto2.h>`, `gp_ios_register.h`, `gp_iccamera.h` under `#if 
 - `ios-framework-plan.md` — the phased plan with per-phase status + risks (LGPL, -21249).
 - `ios-phase0-runbook.md` — the PTP-over-ICCameraDevice probe + corrected Canon opcode map.
 - `canon-cameras.md` — Canon protocol details (EOS vs PowerShot dialects, opcodes, config).
+- `canon-battery-level.md` — why `batterylevel` read `100%` forever, the driver fix, and the **Swift contract** (it's a 5-state gauge on R50/R50 V, and can return `"Low"` — not always a number).
+- `canon-movie-remaining-time.md` — the camera never transmits remaining rec time; the formula (`free × 8 ÷ bitrate × 0.9499`), `0xD257` recording-format codes, and the **stale-property-replay gotcha** (take the LAST event, not the first).
 - `03-ptp2-driver.md`, `05-config-reference.md` — ptp2 internals + the 359-setting config reference.
 - `ios/README.md` — the iOS build harness.

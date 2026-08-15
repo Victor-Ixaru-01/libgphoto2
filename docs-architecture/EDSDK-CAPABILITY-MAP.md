@@ -111,7 +111,7 @@ All three EDSDK handler kinds map onto the single Canon EOS event queue drained 
 
 | Item | ptp2 path | Status |
 |---|---|---|
-| Battery level | config `batterylevel` / deviceprop | ⏳ (read + update) |
+| Battery level | config `batterylevel` / deviceprop | ✅ read — driver fix, it reported `100%` forever. **5-state gauge on R50/R50 V, not a percentage**; can also return `"Low"`. See [canon-battery-level.md](canon-battery-level.md). |
 | White Balance | config `whitebalance` | ✅ (curated; read/set/update) |
 | PictureStyle | config `picturestyle` (+ `PictureStyleDesc` detail) | ⏳ partial (base style via full list; sub-params TODO) |
 | AE Mode | config `autoexposuremode` | ✅ (curated) |
