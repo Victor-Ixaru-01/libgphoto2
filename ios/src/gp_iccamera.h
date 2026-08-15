@@ -85,6 +85,16 @@ int gp_iccamera_get_config(gp_iccamera *, const char *name,
                            char *value, int vlen, char *choices, int clen);
 int gp_iccamera_set_config(gp_iccamera *, const char *name, const char *value);
 
+/* Free and total space in KB for the PRIMARY storage slot (the first storage ID the camera
+ * reports — on a two-slot body that is slot 1, and a slot with no card is not reported at
+ * all). Pass NULL for either output if not needed.
+ * Returns 0 on success, negative on error. A field the camera reports as "unknown" is set
+ * to -1 rather than a bogus number, so check for < 0 before using a value.
+ * Uses the standard PTP GetStorageIDs/GetStorageInfo (which is what ptp2's own
+ * storage_info_func uses — the Canon EOS GetStorageInfo variant returns an undecoded blob);
+ * returns negative if the body does not support the operation. Background thread only. */
+int gp_iccamera_get_storageinfo(gp_iccamera *, int64_t *free_kb, int64_t *total_kb);
+
 /* Canon EOS live view (streamed EVF frames).
  *   _start  → route the EVF to "PC" and enter live-view mode (call once). Writes a
  *             human trace to `status`. Returns 0 on success, negative on failure.

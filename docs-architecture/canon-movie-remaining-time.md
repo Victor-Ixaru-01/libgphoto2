@@ -43,7 +43,10 @@ measured at another resolution and drifts.
 ## Properties that feed it
 
 ### Free space
-`gp_camera_get_storageinfo` → `free` (KB). Not a device property.
+Not a device property. From the bridge: **`gp_iccamera_get_storageinfo(cam, &free_kb, &total_kb)`**
+— primary slot, KB, `-1` for a field the camera doesn't report. It wraps the *standard* PTP
+`GetStorageIDs`/`GetStorageInfo`, the same pair ptp2's own `storage_info_func` uses; the Canon
+EOS `GetStorageInfo` variant returns an undecoded blob and is not usable.
 
 ### `0xD257` — recording format (R50 V)
 
@@ -66,9 +69,14 @@ Resolution + frame rate. See [canon-movie-recording-size.md](canon-movie-recordi
 struct layout. R50 = `MovieParam5` (40 bytes, fps at word 1); R50 V = `MovieParam6` (32 bytes,
 actual fps at word 7). Word 2 is the resolution code (`0` = 1920×1080, `5` = 3840×2160) on both.
 
-On the **R50**, word 5 selects the compression variant (IPB Standard vs IPB Light) — inferred, not
-measured: it is the only field that differs between the two option-list entries for a given
-resolution+fps, and compression is the only remaining axis.
+On the **R50**, word 5 is the compression variant — `0` = IPB Standard, `1` = IPB Light.
+**Confirmed by direct A/B toggle** with resolution and frame rate held fixed: switching the
+camera's IPB setting moved the packed value between `0x0005095e` and `0x0105095e`, changing
+nothing else.
+
+The driver packs it into bit 24, so the availlist distinguishes the variants. Without it the
+R50's 10 available modes (5 resolution/fps combos × 2 IPB variants) collapse into 5 duplicate
+values and a picker cannot offer the choice.
 
 ### `0xD20C` — HDR PQ (R50)
 
@@ -219,7 +227,8 @@ func secondsRemaining(freeBytes: Int64, format: RecordingFormat) -> Double? {
 ```
 
 Read `0xD257` with `gp_iccamera_get_eosprop(cam, 0xD257, &value, &datatype, ...)`, movie size with
-`gp_iccamera_get_movie_size()`, free space from the storage info.
+`gp_iccamera_get_movie_size()`, free space with `gp_iccamera_get_storageinfo()` — note it returns
+**KB**, so the formula above needs `freeBytes = free_kb * 1024`.
 
 ## What is not verified
 
@@ -227,8 +236,8 @@ Read `0xD257` with `gp_iccamera_get_eosprop(cam, 0xD257, &value, &datatype, ...)
   that body. `k` held across resolution on the R50, which is reassuring but is two points in one
   codec.
 - **154.2 Mbps is derived, not observed** — see the note above.
-- **`w5` as the R50 compression flag** is inference from the option list, never read back in a
-  known-Light state.
+- ~~`w5` as the R50 compression flag~~ **Confirmed** by A/B toggle in both directions, resolution
+  and frame rate held constant.
 - **`w8` as bit depth** in `MovieParam5` rests on a single 10→8 transition that matches HDR PQ's
   known bit depths. `w7` (2→1) is assumed to be a gamma/colour flag on the same basis. `d210` moves
   with HDR PQ but is entirely unidentified.

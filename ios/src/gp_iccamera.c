@@ -418,6 +418,45 @@ gp_iccamera_set_config(gp_iccamera *icc, const char *name, const char *value)
 	return ret;
 }
 
+int
+gp_iccamera_get_storageinfo(gp_iccamera *icc, int64_t *free_kb, int64_t *total_kb)
+{
+	PTPParams     *params = &icc->camera->pl->params;
+	PTPStorageIDs  ids = {0};
+	PTPStorageInfo si;
+	uint16_t       r;
+
+	if (free_kb)  *free_kb  = -1;
+	if (total_kb) *total_kb = -1;
+
+	/* The Canon EOS GetStorageInfo (ptp_canon_eos_getstorageinfo) hands back an undecoded
+	 * blob -- it still carries a "FIXME: do stuff with data" in ptp.c. ptp2's own
+	 * storage_info_func uses the standard operations instead, so we do the same. */
+	if (!ptp_operation_issupported(params, PTP_OC_GetStorageIDs))
+		return -1;
+
+	if (ptp_getstorageids(params, &ids) != PTP_RC_OK)
+		return -2;
+	if (ids.len == 0) {
+		free_array(&ids);
+		return -3;   /* no card */
+	}
+
+	memset(&si, 0, sizeof(si));
+	r = ptp_getstorageinfo(params, ids.val[0], &si);   /* primary slot */
+	free_array(&ids);
+	if (r != PTP_RC_OK)
+		return -4;
+
+	/* 0xffffffff is the "not reported" sentinel, and the values are in BYTES. */
+	if (free_kb  && si.FreeSpaceInBytes != 0xffffffff) *free_kb  = (int64_t)(si.FreeSpaceInBytes / 1024);
+	if (total_kb && si.MaxCapability    != 0xffffffff) *total_kb = (int64_t)(si.MaxCapability / 1024);
+
+	free(si.StorageDescription);
+	free(si.VolumeLabel);
+	return 0;
+}
+
 /* Ported from ptp2's camera_trigger_canon_eos_capture (non-M path), using only exported
  * ptp_* functions so it runs over our transport. First iteration — logs each step so the
  * real device behaviour can be read from `status`. */
