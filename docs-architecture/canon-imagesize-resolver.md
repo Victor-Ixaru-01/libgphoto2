@@ -14,6 +14,9 @@ your app can show megapixels **before** a frame exists.
   [`ios/src/gp_canon_imagesize.c`](../ios/src/gp_canon_imagesize.c)
 - Test: [`ios/src/smoke_test.c`](../ios/src/smoke_test.c) → `check_imagesize()`
 - Ships inside `libgphoto2.xcframework` (both slices' `Headers/`).
+- See also: [`canon-imageformat-heif.md`](canon-imageformat-heif.md) — how the `imageformat`
+  label itself is read and written, and the HDR PQ / HEIF and JPEG-size-class fixes in the
+  ptp2 driver that this resolver's input depends on.
 
 ---
 
@@ -199,6 +202,12 @@ let summary = sizes.map { "\($0.display) (\($0.mpDisplay))" }.joined(separator: 
 
 5. **Dual formats** (`RAW + JPEG`) return two entries, in label order — `out[0]` for the
    first component, `out[1]` for the second.
+
+6. **HEIF needs no separate handling.** With HDR PQ on the body records `.HIF` instead of
+   `.JPG`, but the size classes and their pixel dimensions are unchanged — `L` is the same
+   `L`. The label the resolver receives is identical, so the table stays as it is. The
+   container swap lives entirely in the ptp2 driver
+   (see [`canon-imageformat-heif.md`](canon-imageformat-heif.md)).
 
 ---
 

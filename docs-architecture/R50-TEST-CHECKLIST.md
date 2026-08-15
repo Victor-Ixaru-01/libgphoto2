@@ -68,6 +68,16 @@ ptp2 doesn't parse the level, so this run is to *find* how the camera sends it.
 - [ ] Confirm **nothing is written to the device** (no `saved:` line — that path was removed).
 - [ ] Set imageformat to **RAW**, Capture → shot fires, no preview (CR3 can't render), file remains on the card.
 
+## 8b. imageformat / HDR PQ (driver fix — **not yet hardware-verified**)
+See `canon-imageformat-heif.md` for what each case is proving.
+- [ ] HDR PQ **On** (set on the body) → set `L` / `M` / `S1` / `S2` → each `set imageformat = … ✓`.
+  - Before the fix *every* one of these failed while HDR PQ was on; that was the whole bug.
+- [ ] HDR PQ **On** → set the `c` variants (`cL`, `cS1`, …) → succeed. Capture → files are `.HIF`.
+- [ ] HDR PQ **On** → set `RAW` alone → succeeds (this one worked before the fix too).
+- [ ] HDR PQ **Off** → repeat the whole list → succeed, files are `.JPG`.
+- [ ] Dual **`cRAW + L`** in both HDR PQ states → **two** files recorded, not just the CR3.
+- [ ] Choice list shows `S1` before `S2` and no duplicate labels.
+
 ## 9. Auto-download-preview of body shots (step 4)
 - [ ] With imageformat = **JPEG**, shoot **on the camera body** → `event: object <hex> (…bytes) — auto-downloading` then `⬇︎ previewed …-byte JPEG (stays on camera)` + inline preview. Nothing saved.
 - [ ] With imageformat = **RAW**, shoot on the body → `shot on camera (fmt 0x….) — left on card` (no transfer).
