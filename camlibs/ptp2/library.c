@@ -3585,6 +3585,53 @@ camera_capture_stream_preview (Camera *camera, CameraFile *file, GPContext *cont
 	return GP_ERROR_NOT_SUPPORTED;
 }
 
+/* The Canon EOS liveview buffer is a sequence of [u32 len][u32 type][payload] records.
+ * Besides the JPEG itself (types 1/9/11) the camera reports assorted shooting metadata
+ * that is not available via any device property. Pick out the ones we expose.
+ */
+#define PTP_CANON_EOS_EVF_FOCALLENGTH	0x21	/* u32, current focal length in mm */
+
+static void
+canon_eos_evf_record (PTPParams *params, const unsigned char *rec, uint32_t len, uint32_t type)
+{
+	switch (type) {
+	case PTP_CANON_EOS_EVF_FOCALLENGTH:
+		if (len < 12) {
+			GP_LOG_E ("EVF focal length record too short: %d bytes", len);
+			break;
+		}
+		params->canon_evf_focallength = dtoh32a(rec+8);
+		GP_LOG_D ("EVF focal length: %u mm", params->canon_evf_focallength);
+		break;
+	}
+}
+
+/* Pull one liveview frame just for its metadata records and throw the image away.
+ * Only useful while liveview is already running; the caller checks that.
+ */
+int
+canon_eos_evf_refresh_metadata (Camera *camera)
+{
+	PTPParams	*params = &camera->pl->params;
+	unsigned char	*data = NULL;
+	uint32_t	size = 0, xoff = 0;
+
+	C_PTP (ptp_canon_eos_get_viewfinder_image (params, &data, &size));
+	while (xoff + 8 <= size) {
+		uint32_t len  = dtoh32a(data+xoff);
+		uint32_t type = dtoh32a(data+xoff+4);
+
+		if (len < 8 || len > size - xoff) {
+			GP_LOG_E ("EVF record len=%d at offset %d exceeds buffer size %d", len, xoff, size);
+			break;
+		}
+		canon_eos_evf_record (params, data+xoff, len, type);
+		xoff += len;
+	}
+	free (data);
+	return GP_OK;
+}
+
 static int
 camera_capture_preview (Camera *camera, CameraFile *file, GPContext *context)
 {
@@ -3706,6 +3753,7 @@ camera_capture_preview (Camera *camera, CameraFile *file, GPContext *context)
 							GP_LOG_E ("len=%d larger than rest size %ld", len, (size-(xdata-data)));
 						}
 						GP_LOG_DATA ((char*)xdata, len, "get_viewfinder_image header:");
+						canon_eos_evf_record (params, xdata, len, type);
 						xdata = xdata+len;
 						continue;
 					case 9:
@@ -3737,6 +3785,7 @@ camera_capture_preview (Camera *camera, CameraFile *file, GPContext *context)
 							}
 							GP_LOG_D ("get_viewfinder_image header: len=%d type=%d", len, type);
 							GP_LOG_DATA ((char*)xdata, len, "get_viewfinder_image header:");
+							canon_eos_evf_record (params, xdata, len, type);
 							xdata = xdata+len;
 						}
 						free (data);

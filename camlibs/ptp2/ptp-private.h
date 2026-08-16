@@ -46,6 +46,10 @@ int translate_ptp_result (uint16_t result);
 uint16_t translate_gp_result_to_ptp (int gp_result);
 int fixup_cached_deviceinfo (Camera *camera, PTPDeviceInfo*);
 
+/* fetch one Canon EOS liveview frame and decode just its metadata records into
+ * params (currently canon_evf_focallength). Requires liveview to be running. */
+int canon_eos_evf_refresh_metadata (Camera *camera);
+
 int chdk_init(Camera*,GPContext*);
 uint16_t ptp_init_camerafile_handler (PTPDataHandler *handler, CameraFile *file);
 uint16_t ptp_exit_camerafile_handler (PTPDataHandler *handler);
