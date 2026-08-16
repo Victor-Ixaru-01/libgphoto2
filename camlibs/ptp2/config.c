@@ -5116,6 +5116,43 @@ static struct deviceproptableu8 nikon_effect_modes[] = {
 GENERIC8TABLE(NIKON_EffectMode,nikon_effect_modes)
 
 
+/* Canon EOS reports the current focal length only in the liveview stream, not as a
+ * device property. camera_capture_preview() caches it as frames go by; if nothing has
+ * been seen yet and liveview is running, fetch one frame to fill it in.
+ */
+static int
+_get_Canon_EOS_FocalLength(CONFIG_GET_ARGS) {
+	PTPParams	*params = &camera->pl->params;
+	char		str[32];
+
+	/* Nothing seen yet: if the camera is streaming liveview to the PC we can pull one
+	 * frame just for its metadata. params->inliveview only covers liveview started by
+	 * this session, so also consult the camera's own EVF output setting. */
+	if (!params->canon_evf_focallength) {
+		PTPDevicePropDesc	dpd;
+
+		memset (&dpd, 0, sizeof(dpd));
+		if (	params->inliveview ||
+			((ptp_canon_eos_getdevicepropdesc (params, PTP_DPC_CANON_EOS_EVFOutputDevice, &dpd) == PTP_RC_OK) &&
+			 (dpd.CurrentValue.u32 & 2))	/* bit 1 = PC */
+		) {
+			int r = canon_eos_evf_refresh_metadata (camera);
+			if (r != GP_OK)
+				GP_LOG_E ("could not refresh liveview metadata: %d", r);
+		}
+		ptp_free_devicepropdesc (&dpd);
+	}
+
+	gp_widget_new (GP_WIDGET_TEXT, _(menu->label), widget);
+	gp_widget_set_name (*widget, menu->name);
+	if (params->canon_evf_focallength)
+		snprintf (str, sizeof (str), "%u mm", params->canon_evf_focallength);
+	else
+		snprintf (str, sizeof (str), "%s", _("unknown (liveview not active)"));
+	gp_widget_set_value (*widget, str);
+	return GP_OK;
+}
+
 static int
 _get_Olympus_CurrentFocalLength(CONFIG_GET_ARGS) {
 	char	str[32];
@@ -12073,6 +12110,7 @@ static struct submenu capture_settings_menu[] = {
 	{ N_("RAW+J PC Save Image"),            "pcsaveimgformat",          PTP_DPC_SONY_PcSaveImageFormat,         PTP_VENDOR_SONY,    PTP_DTC_UINT8,  _get_Sony_PcSaveImageFormat,        _put_Sony_PcSaveImageFormat },
 	{ N_("Focus Distance"),                 "focusdistance",            PTP_DPC_FocusDistance,                  0,                  PTP_DTC_UINT16, _get_FocusDistance,                 _put_FocusDistance },
 	{ N_("Focal Length"),                   "focallength",              PTP_DPC_OLYMPUS_CurrentFocalLength,     PTP_VENDOR_GP_OLYMPUS_OMD, PTP_DTC_UINT16, _get_Olympus_CurrentFocalLength, _put_None },
+	{ N_("Focal Length"),                   "focallength",              0,                                      PTP_VENDOR_CANON,   PTP_OC_CANON_EOS_GetViewFinderData, _get_Canon_EOS_FocalLength, _put_None },
 	{ N_("Focal Length"),                   "focallength",              PTP_DPC_FocalLength,                    0,                  PTP_DTC_UINT32, _get_FocalLength,                   _put_FocalLength },
 	{ N_("Focal Position"),                 "focalposition",            PTP_DPC_SONY_FocalPosition,             PTP_VENDOR_SONY,    PTP_DTC_UINT8,  _get_Sony_FocalPosition,            _put_None },
 	{ N_("Focus Mode"),                     "focusmode",                PTP_DPC_FocusMode,                      PTP_VENDOR_SONY,    PTP_DTC_UINT16, _get_FocusMode,                     _put_Sony_FocusMode },

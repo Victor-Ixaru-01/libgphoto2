@@ -4304,6 +4304,9 @@ struct _PTPParams {
 	PTPDevicePropDescs	canon_props;
 	int			canon_viewfinder_on;
 	int			canon_event_mode;
+	/* Canon EOS: current focal length in mm, decoded from liveview record
+	 * PTP_CANON_EOS_EVF_FOCALLENGTH. 0 means "not seen yet". */
+	uint32_t		canon_evf_focallength;
 
 	/* PTP: Canon EOS event queue */
 	PTPCanonEOSEvents	eos_events;
