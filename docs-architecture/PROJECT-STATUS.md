@@ -135,6 +135,7 @@ includes `<gphoto2/gphoto2.h>`, `gp_ios_register.h`, `gp_iccamera.h` under `#if 
 - `ios-phase0-runbook.md` — the PTP-over-ICCameraDevice probe + corrected Canon opcode map.
 - `canon-cameras.md` — Canon protocol details (EOS vs PowerShot dialects, opcodes, config).
 - `canon-battery-level.md` — why `batterylevel` read `100%` forever, the driver fix, and the **Swift contract** (it's a 5-state gauge on R50/R50 V, and can return `"Low"` — not always a number).
+- `canon-focal-length.md` — Canon reports focal length in **no device property at all**; it rides in EVF record `0x21` (verified 18/31/45 mm on an R50). Covers the new `focallength` config + `gp_iccamera_get_focallength()`, why the bridge needed its own hook, why the focal *range* only exists as text in the lens name, and the state of power-zoom (`0xD055`) support.
 - `canon-imageformat-heif.md` — why `imageformat` and quality **could not be set while HDR PQ was on** (the condensed `uint16` has no room for the file type, so packing hardcoded JPEG), plus four JPEG-size-class fixes (`cRAW + L` collapsing to `cRAW`, `"S"` silently selecting `S1`, …). Carries an **on-body checklist** — none of it is hardware-verified yet.
 - `canon-movie-remaining-time.md` — the camera never transmits remaining rec time; the formula (`free × 8 ÷ bitrate × 0.9499`), `0xD257` recording-format codes, and the **stale-property-replay gotcha** (take the LAST event, not the first).
 - `03-ptp2-driver.md`, `05-config-reference.md` — ptp2 internals + the 359-setting config reference.

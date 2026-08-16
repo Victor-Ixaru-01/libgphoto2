@@ -134,6 +134,13 @@ int gp_iccamera_get_evf_frame(gp_iccamera *, int *x, int *y, int *w, int *h);
  * >18000 = negative). Returns 0 with values set, or -1. */
 int gp_iccamera_get_level(gp_iccamera *, uint32_t *a, uint32_t *b);
 
+/* Current focal length in mm (EVF record type 33 / 0x21) from the last live-view frame. Canon
+ * exposes this in no device property at all — the lens name (0xD1D8) only carries the nominal
+ * range as text, e.g. "RF-S18-45mm F4.5-6.3 IS STM". The record rides in every frame, so this
+ * tracks a zooming lens live; it needs live view running. Verified on an R50 at 18/31/45mm.
+ * Returns 0 with *mm set, or -1 before the first frame has been fetched. */
+int gp_iccamera_get_focallength(gp_iccamera *, uint32_t *mm);
+
 /* Camera orientation, derived from the roll of the EVF electronic level (record type 16). */
 typedef enum {
 	GP_ICCAMERA_ORIENTATION_UNKNOWN            = -1, /* level not reported yet          */

@@ -59,6 +59,10 @@ struct gp_iccamera {
 	 * each mod 36000 (>18000 means negative). */
 	uint32_t       evf_level_a, evf_level_b;
 	int            evf_level_valid;
+
+	/* Current focal length in mm from EVF record type 33 (0x21), a single u32. Present in
+	 * every frame, so it tracks a zooming lens live. 0 until a frame has been fetched. */
+	uint32_t       evf_focallength;
 };
 
 /* --- little-endian helpers --- */
@@ -681,6 +685,11 @@ gp_iccamera_liveview_frame(gp_iccamera *icc, uint8_t **outdata, int *outlen,
 			icc->evf_level_a = get32(payload + 8);   /* roll  x100 (mod 36000) */
 			icc->evf_level_b = get32(payload + 12);  /* pitch x100 (mod 36000) */
 			icc->evf_level_valid = 1;
+		} else if (type == 33 && plen >= 4) {       /* current focal length, u32 mm */
+			icc->evf_focallength = get32(payload);
+			/* keep the camlib cache in sync so the "focallength" config widget stays
+			 * fresh too — we fetch frames ourselves, so its own hook never runs. */
+			params->canon_evf_focallength = icc->evf_focallength;
 		}
 		xdata += len;
 	}
@@ -774,6 +783,16 @@ gp_iccamera_get_level(gp_iccamera *icc, uint32_t *a, uint32_t *b)
 	if (a) *a = icc->evf_level_a;
 	if (b) *b = icc->evf_level_b;
 	return 0;
+}
+
+/* Current focal length in mm from the last live-view frame (EVF record type 33). Canon reports
+ * this nowhere else — there is no device property for it — and the record rides in every frame,
+ * so this tracks a zooming lens live. Returns 0 with *mm set, or -1 before the first frame. */
+int
+gp_iccamera_get_focallength(gp_iccamera *icc, uint32_t *mm)
+{
+	if (mm) *mm = icc->evf_focallength;
+	return icc->evf_focallength ? 0 : -1;
 }
 
 /* Normalize a raw level angle (x100, mod 36000) to signed centidegrees in (-18000, 18000]. */
